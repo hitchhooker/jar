@@ -494,7 +494,7 @@ fn bench_trace_overhead(c: &mut Criterion) {
             }
         })
     });
-    group.bench_function("fib/stepping-with-trace", |b| {
+    group.bench_function("fib/fast-with-trace", |b| {
         b.iter(|| run_grey_with_tracing(&fib_blob))
     });
 
@@ -515,7 +515,7 @@ fn bench_trace_overhead(c: &mut Criterion) {
             }
         })
     });
-    group.bench_function("sort/stepping-with-trace", |b| {
+    group.bench_function("sort/fast-with-trace", |b| {
         b.iter(|| run_grey_with_tracing(&sort_blob))
     });
 

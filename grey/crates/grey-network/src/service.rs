@@ -660,7 +660,7 @@ async fn run_network_loop(
                             tracing::debug!("Validator {} sending priority finality vote", validator_index);
                         }
                         // Original handler follows:
-                        let _ = priority; // TODO: priority queue routing
+                        let _ = priority;
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(
                             topics.finality.clone(),
                             data,

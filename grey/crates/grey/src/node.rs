@@ -558,7 +558,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                     my_secrets,
                                 ) {
                                     let vote_data = finality::encode_vote_message(&prevote_msg);
-                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote { priority: true,
                                         data: vote_data,
                                     });
                                 }
@@ -569,7 +569,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                     my_secrets,
                                 ) {
                                     let vote_data = finality::encode_vote_message(&precommit_msg);
-                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote { priority: true,
                                         data: vote_data,
                                     });
                                 }
@@ -767,7 +767,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                         my_secrets,
                                     ) {
                                         let vote_data = finality::encode_vote_message(&prevote_msg);
-                                        let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                        let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote { priority: true,
                                             data: vote_data,
                                         });
                                     }
@@ -776,7 +776,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                         my_secrets,
                                     ) {
                                         let vote_data = finality::encode_vote_message(&precommit_msg);
-                                        let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                        let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote { priority: true,
                                             data: vote_data,
                                         });
                                     }
@@ -821,7 +821,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                                 my_secrets,
                                             ) {
                                                 let vote_data = finality::encode_vote_message(&precommit_msg);
-                                                let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                                let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote { priority: true,
                                                     data: vote_data,
                                                 });
                                             }
@@ -938,6 +938,14 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                             config.validator_index,
                             peer_id,
                             vi
+                        );
+                    }
+                    NetworkEvent::ApprovalReceived { data, source } => {
+                        tracing::debug!(
+                            "Validator {} received ELVES approval ({} bytes) from {}",
+                            config.validator_index,
+                            data.len(),
+                            source
                         );
                     }
                 }
