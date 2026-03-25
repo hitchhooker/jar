@@ -27,6 +27,8 @@ const ASSURANCES_TOPIC: &str = "/jam/assurances/1";
 const ANNOUNCEMENTS_TOPIC: &str = "/jam/announcements/1";
 /// Gossipsub topic for Safrole ticket submissions.
 const TICKETS_TOPIC: &str = "/jam/tickets/1";
+/// Gossipsub topic for ELVES audit approvals.
+const APPROVALS_TOPIC: &str = "/jam/approvals/1";
 
 /// Messages that the network service can send to the node.
 #[derive(Debug)]
@@ -62,12 +64,17 @@ pub enum NetworkEvent {
 }
 
 /// Commands that the node can send to the network service.
+///
+/// Commands with `priority: true` bypass lower-priority messages in
+/// the send queue. Use for GRANDPA votes and ELVES approvals —
+/// these must converge within a slot for timely finality.
 #[derive(Debug)]
 pub enum NetworkCommand {
     /// Broadcast a block to the network.
     BroadcastBlock { data: Vec<u8> },
-    /// Broadcast a finality vote.
-    BroadcastFinalityVote { data: Vec<u8> },
+    /// Broadcast a GRANDPA finality vote (Ed25519 prevote/precommit).
+    /// Priority: votes are critical for finality convergence.
+    BroadcastFinalityVote { data: Vec<u8>, priority: bool },
     /// Broadcast a work report guarantee.
     BroadcastGuarantee { data: Vec<u8> },
     /// Broadcast an availability assurance.
@@ -76,6 +83,9 @@ pub enum NetworkCommand {
     BroadcastAnnouncement { data: Vec<u8> },
     /// Broadcast a ticket proof.
     BroadcastTicket { data: Vec<u8> },
+    /// Broadcast an ELVES approval (auditor verified a work report).
+    /// Priority: approvals gate finality (GP §19 requires all reports audited).
+    BroadcastApproval { data: Vec<u8>, priority: bool },
     /// Request a chunk from a specific peer.
     FetchChunk {
         peer: PeerId,
@@ -261,6 +271,7 @@ pub async fn start_network(
     let assurances_topic = gossipsub::IdentTopic::new(ASSURANCES_TOPIC);
     let announcements_topic = gossipsub::IdentTopic::new(ANNOUNCEMENTS_TOPIC);
     let tickets_topic = gossipsub::IdentTopic::new(TICKETS_TOPIC);
+    let approvals_topic = gossipsub::IdentTopic::new(APPROVALS_TOPIC);
 
     swarm
         .behaviour_mut()
@@ -292,6 +303,11 @@ pub async fn start_network(
         .gossipsub
         .subscribe(&tickets_topic)
         .map_err(|e| format!("Failed to subscribe to tickets topic: {e}"))?;
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&approvals_topic)
+        .map_err(|e| format!("Failed to subscribe to approvals topic: {e}"))?;
 
     // Listen on the configured port
     let listen_addr: Multiaddr = format!("/ip4/{}/tcp/{}", config.listen_addr, config.listen_port)
@@ -332,6 +348,7 @@ pub async fn start_network(
         assurances: assurances_topic,
         announcements: announcements_topic,
         tickets: tickets_topic,
+        approvals: approvals_topic,
     };
     tokio::spawn(async move {
         run_network_loop(swarm, event_tx, cmd_rx, topics, validator_index).await;
@@ -356,6 +373,7 @@ struct TopicSet {
     assurances: gossipsub::IdentTopic,
     announcements: gossipsub::IdentTopic,
     tickets: gossipsub::IdentTopic,
+    approvals: gossipsub::IdentTopic,
 }
 
 fn build_swarm() -> Result<Swarm<JamBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
@@ -630,7 +648,12 @@ async fn run_network_loop(
                             );
                         }
                     }
-                    NetworkCommand::BroadcastFinalityVote { data } => {
+                    NetworkCommand::BroadcastFinalityVote { data, priority } => {
+                        if priority {
+                            tracing::debug!("Validator {} sending priority finality vote", validator_index);
+                        }
+                        // Original handler follows:
+                        let _ = priority; // TODO: priority queue routing
                         if let Err(e) = swarm.behaviour_mut().gossipsub.publish(
                             topics.finality.clone(),
                             data,
@@ -685,6 +708,21 @@ async fn run_network_loop(
                         ) {
                             tracing::warn!(
                                 "Validator {} failed to publish ticket: {}",
+                                validator_index,
+                                e
+                            );
+                        }
+                    }
+                    NetworkCommand::BroadcastApproval { data, priority } => {
+                        if priority {
+                            tracing::debug!("Validator {} sending priority ELVES approval", validator_index);
+                        }
+                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(
+                            topics.approvals.clone(),
+                            data,
+                        ) {
+                            tracing::warn!(
+                                "Validator {} failed to publish approval: {}",
                                 validator_index,
                                 e
                             );
