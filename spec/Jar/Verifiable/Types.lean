@@ -5,29 +5,43 @@ import Jar.Commitment.Merkle
 /-!
 # Verifiable Execution Types
 
-Data structures for the trace commitment + grand product memory proof
-architecture. The guarantor produces:
+Data structures for the trace commitment + grand product memory proof.
 
+## Architecture
+
+The guarantor produces two artifacts per work report:
 1. **Trace commitment**: Merkle root over basic block boundary states
-2. **Memory proof**: Ligerito grand product proving all memory reads
-   are consistent with writes
+2. **Memory proof**: Ligerito grand product proving memory access logs
+   are a permutation (original order ↔ sorted order)
 
-The ELVES committee spot-checks ALU correctness by re-executing
-assigned basic blocks against the committed trace. Memory consistency
-is unconditionally proven; ALU correctness has ELVES rational-adversary
-security.
+The ELVES committee verifies:
+- Sorted ordering of the memory log (linear scan)
+- Read-after-write consistency (linear scan)
+- ALU correctness (basic block re-execution)
 
-## Polynomial layout (2^20, Ligerito sweet spot)
+## Polynomial layout
 
-The combined polynomial packs both claims into one proof:
-- Block boundary states: 50K blocks × 15 GF(2^32) elements = 750K
-- Memory access log:    50K accesses × 5 GF(2^32) elements = 250K
-- Total: ~1M elements = 2^20
+The polynomial contains ONLY memory access logs (block boundaries
+are committed via Merkle tree, NOT in the polynomial):
 
-## References
+  Original access log: N entries × 6 GF(2^32) elements
+  Sorted access log:   N entries × 6 GF(2^32) elements
+  Total: 12N elements
 
-- DESIGN.md (repo root) — full architecture
-- ELVES paper: eprint 2024/961
+Each entry is 6 GF(2^32) elements:
+  addr(1) + value_lo(1) + value_hi(1) + seq(1) + width(1) + flags(1)
+
+For 50K accesses: 12 × 50K = 600K ≈ 2^20.
+
+## Security model
+
+- Permutation: unconditional (Ligerito grand product, all validators)
+- Sorted ordering + read consistency: ELVES (rational adversary)
+- ALU correctness: ELVES (rational adversary)
+- State continuity: ELVES (Merkle proof + re-execution)
+
+Note: "unconditional" applies only to the permutation check.
+Sorting and read-consistency depend on ELVES committee honesty.
 -/
 
 namespace Jar.Verifiable
@@ -40,17 +54,17 @@ open Jar.Commitment.CMerkle
 -- PVM State Snapshots
 -- ============================================================================
 
-/-- Number of PVM registers. -/
+/-- Number of PVM registers (rv64em: ra, sp, t0-t2, s0-s1, a0-a5). -/
 def NUM_REGS : Nat := 13
 
 /-- PVM state at a basic block boundary.
     Captured at block entry and exit during execution. -/
 structure PvmSnapshot where
-  /-- Program counter. -/
+  /-- Program counter (ı). -/
   pc : UInt32
-  /-- Register file (13 registers: ra, sp, t0-t2, s0-s1, a0-a5). -/
+  /-- Register file (13 registers). -/
   regs : Array UInt64
-  /-- Remaining gas. -/
+  /-- Remaining gas (ϱ). -/
   gas : UInt64
   deriving BEq, Inhabited
 
@@ -65,43 +79,54 @@ end PvmSnapshot
 -- ============================================================================
 
 /-- A single basic block execution record.
-    A basic block is a straight-line instruction sequence (no branches
-    except at the end). Given `entry`, the `exit` is deterministic —
-    exactly one possible outcome (refinement has no host calls). -/
+
+    A basic block is a straight-line instruction sequence ending at a
+    terminator. Given `entry` state AND memory read values, the `exit`
+    state is deterministic. Note: refinement CAN invoke host calls
+    (peek, poke, fetch, etc. per GP §14.3), so determinism requires
+    the memory access log as input, not just the entry register state. -/
 structure BlockBoundary where
-  /-- Block index (sequential, 0-based). -/
-  index : UInt32
   /-- PVM state at block entry. -/
   entry : PvmSnapshot
   /-- PVM state at block exit. -/
   exit : PvmSnapshot
   /-- Number of instructions in this block. -/
   instructionCount : UInt32
-  /-- Gas consumed (entry.gas - exit.gas). -/
-  gasCost : UInt64
-  deriving Inhabited
+  deriving BEq, Inhabited
+
+namespace BlockBoundary
+
+/-- Gas consumed by this block (derived, not stored). -/
+def gasCost (b : BlockBoundary) : UInt64 := b.entry.gas - b.exit.gas
+
+end BlockBoundary
 
 -- ============================================================================
 -- Memory Access Log
 -- ============================================================================
 
-/-- A single memory access during PVM execution.
-    Recorded for the grand product consistency proof.
+/-- Access width in bytes (1, 2, 4, or 8). Matches PVM load/store
+    instruction widths (lb/lh/lw/ld, sb/sh/sw/sd). -/
+inductive AccessWidth where
+  | byte1 | byte2 | byte4 | byte8
+  deriving BEq, Inhabited
 
-    The seq field is a monotonic counter encoding execution order.
-    The grand product proof commits to seqs AND verifies they are
-    monotonically increasing in the original (execution-order) log.
-    This prevents the guarantor from reordering accesses to forge
-    consistency. Timestamps are part of the committed polynomial. -/
+/-- A single memory access during PVM execution.
+    Recorded for the grand product permutation proof.
+
+    The `seq` field is a monotonic counter (0, 1, 2, ...) encoding
+    execution order. The polynomial constrains seq_i == i for uniqueness.
+    Without this, the grand product (multiset equality) would allow
+    the guarantor to duplicate entries. -/
 structure MemoryAccess where
   /-- Memory address accessed. -/
   address : UInt32
-  /-- Value read or written. -/
+  /-- Value read or written (up to 8 bytes, little-endian). -/
   value : UInt64
-  /-- Monotonic seq (execution order). Must be strictly
-      increasing in the original access log. Committed in the
-      polynomial and verified by the grand product. -/
+  /-- Monotonic sequence number (execution order). -/
   seq : UInt32
+  /-- Access width (1, 2, 4, or 8 bytes). -/
+  width : AccessWidth
   /-- True if store, false if load. -/
   isWrite : Bool
   deriving BEq, Inhabited
@@ -111,16 +136,15 @@ structure MemoryAccess where
 -- ============================================================================
 
 /-- Trace commitment: Merkle root over basic block boundary states.
-    Produced by the guarantor during execution (~5ms overhead).
-    Goes into the work report as `trace_root` (32 bytes). -/
+    Produced by the guarantor during execution.
+    Goes into the work report's availability segment. -/
 structure TraceCommitment where
-  /-- Merkle root over serialized BlockBoundary entries. -/
+  /-- Merkle root over serialized BlockBoundary entries.
+      Leaf i = serialized BlockBoundary for block i (ordered). -/
   root : ByteArray
   /-- Number of basic blocks in the trace. -/
   numBlocks : UInt32
-  /-- Total instructions executed. -/
-  totalInstructions : UInt64
-  deriving Inhabited
+  deriving BEq, Inhabited
 
 namespace TraceCommitment
 
@@ -133,40 +157,38 @@ end TraceCommitment
 -- Memory Consistency Proof
 -- ============================================================================
 
+/-- Maximum log₂ polynomial size accepted by validators.
+    Limits verifier work. Programs exceeding this must split proofs
+    or fall back to pure ELVES re-execution. -/
+def MAX_LOG_SIZE : Nat := 24  -- 2^24 = 16M elements
+
 /-- Grand product memory permutation proof (Ligerito).
 
     Proves that the original access log (execution order) and the
-    sorted access log (by address, then seq) contain the SAME
-    set of entries. This is a PERMUTATION proof, not a full memory
-    consistency proof.
+    sorted access log (by address, then seq) are the SAME multiset.
 
     Grand product: Π(α - original_i) = Π(α - sorted_i)
-      → α is a random Fiat-Shamir challenge
-      → proves the two logs are rearrangements of each other
 
-    The polynomial contains ONLY the two access logs:
-      Original: 50K entries × 5 GF(2^32) elements = 250K
-      Sorted:   50K entries × 5 GF(2^32) elements = 250K
-      Total:    ~500K ≈ 2^19, padded to 2^20
+    The polynomial contains ONLY the two access logs. Block boundaries
+    are in the Merkle tree (TraceCommitment), NOT in the polynomial.
 
-    What is NOT proven in the circuit (verified by ELVES instead):
-    - Sorted ordering (requires integer comparison in GF(2^32))
+    What the proof does NOT cover (verified by ELVES committee):
+    - Sorted ordering (integer comparison in GF(2^32) is expensive)
     - Read-after-write consistency
-    - State continuity (in Merkle tree, not polynomial)
-
-    This split avoids integer comparison gates in the binary field
-    circuit. The ELVES auditor verifies sorting + read consistency
-    with a linear scan (~500µs, native integer comparisons). -/
+    - State continuity (Merkle tree + re-execution) -/
 structure MemoryProof where
-  /-- Ligerito proof over the combined polynomial
-      (block boundaries + memory access log). -/
+  /-- Ligerito proof over the permutation polynomial. -/
   proof : LigeritoProof
-  /-- log₂ of polynomial size (typically 20). -/
+  /-- log₂ of polynomial size. -/
   logSize : Nat := 20
   /-- Number of memory accesses covered. -/
   numAccesses : UInt32
   /-- Program hash (binds proof to specific code). -/
   programHash : ByteArray
+  /-- Ligerito commitment root. This is NOT the erasure_root —
+      it is a separate commitment over the GF(2^32) polynomial.
+      Must be verified independently from the DA erasure root. -/
+  commitmentRoot : ByteArray
 
 instance : Inhabited MemoryProof where
   default := {
@@ -181,12 +203,16 @@ instance : Inhabited MemoryProof where
     logSize := 20
     numAccesses := 0
     programHash := ByteArray.mk #[]
+    commitmentRoot := ByteArray.mk #[]
   }
 
 namespace MemoryProof
 
 def valid (mp : MemoryProof) : Bool :=
-  mp.programHash.size == 32 && mp.logSize >= 20
+  mp.programHash.size == 32
+  && mp.commitmentRoot.size == 32
+  && mp.logSize >= 20
+  && mp.logSize <= MAX_LOG_SIZE
 
 end MemoryProof
 
@@ -194,24 +220,35 @@ end MemoryProof
 -- Work Report Extension
 -- ============================================================================
 
-/-- New fields added to the work report for verifiable execution. -/
+/-- New fields for verifiable execution, carried in the work report's
+    availability segment (NOT overloading erasure_root). -/
 structure VerifiableFields where
   /-- Merkle root over basic block boundary states. -/
   traceRoot : ByteArray
-  /-- BLAKE2b hash of the serialized MemoryProof (stored in DA segment). -/
+  /-- BLAKE2b hash of the serialized MemoryProof. -/
   proofHash : ByteArray
+  /-- Ligerito commitment root (separate from erasure_root). -/
+  commitmentRoot : ByteArray
   deriving BEq, Inhabited
 
 namespace VerifiableFields
 
 def valid (vf : VerifiableFields) : Bool :=
-  vf.traceRoot.size == 32 && vf.proofHash.size == 32
+  vf.traceRoot.size == 32
+  && vf.proofHash.size == 32
+  && vf.commitmentRoot.size == 32
 
 end VerifiableFields
 
 -- ============================================================================
 -- ELVES Committee Assignment
 -- ============================================================================
+
+/-- Domain tag for committee member selection hashes. -/
+def ELVES_COMMITTEE_TAG : UInt8 := 0x01
+
+/-- Domain tag for block assignment hashes. -/
+def ELVES_BLOCK_TAG : UInt8 := 0x02
 
 /-- ELVES committee assignment for a work report.
     Determined by VRF from the NEXT slot's block — the committee is
@@ -227,24 +264,18 @@ structure ELVESAssignment where
 
 namespace ELVESAssignment
 
-/-- Derive an ELVES committee assignment deterministically from
-    a VRF output and work report parameters.
+/-- Derive an ELVES committee assignment deterministically from VRF.
 
-    The VRF output comes from the NEXT slot's block author — it's
-    unpredictable when the guarantor produces the trace (preventing
-    targeting). The assignment is a pure function of:
-    - vrfOutput: 32-byte Bandersnatch VRF output hash
-    - coreIndex: which core the work report is for
-    - numValidators: total validator count (1023)
-    - numBlocks: total basic blocks in the trace
-
-    Each auditor is assigned ~5 blocks to re-execute. The assignment
-    is deterministic so any validator can verify it. -/
+    Domain separation: committee selection uses tag 0x01, block
+    assignment uses tag 0x02, preventing hash input collisions
+    (Komlo review). -/
 def derive (vrfOutput : ByteArray) (coreIndex : UInt32)
     (numValidators numBlocks : UInt32)
     (committeeSize blocksPerAuditor : UInt32)
     : ELVESAssignment := Id.run do
   if vrfOutput.size != 32 then return default
+  if numValidators == 0 then return default
+  if numBlocks == 0 then return default
   -- Derive per-core seed: BLAKE2b("jar-elves-v1" || vrfOutput || coreIndex)
   let mut seedInput := "jar-elves-v1".toUTF8
   seedInput := seedInput ++ vrfOutput
@@ -256,12 +287,13 @@ def derive (vrfOutput : ByteArray) (coreIndex : UInt32)
   ]
   let coreSeed := (Jar.Crypto.blake2b seedInput).data
 
-  -- Select committee members by hashing seed + counter
+  -- Select committee members (domain tag 0x01)
   let mut auditors : Array UInt32 := #[]
   let mut counter : UInt32 := 0
-  while auditors.size < committeeSize.toNat && counter < numValidators * 2 do
+  while auditors.size < committeeSize.toNat && counter < numValidators * 3 do
     let mut input := coreSeed
     input := input ++ ByteArray.mk #[
+      ELVES_COMMITTEE_TAG,
       (counter &&& 0xFF).toUInt8,
       ((counter >>> 8) &&& 0xFF).toUInt8,
       ((counter >>> 16) &&& 0xFF).toUInt8,
@@ -275,18 +307,20 @@ def derive (vrfOutput : ByteArray) (coreIndex : UInt32)
       auditors := auditors.push idx
     counter := counter + 1
 
-  -- Assign blocks to each auditor
+  -- Assign blocks to each auditor (domain tag 0x02)
   let mut assignedBlocks : Array (Array UInt32) := #[]
   for i in [:auditors.size] do
     let auditorIdx := auditors[i]!
     let mut blocks : Array UInt32 := #[]
-    for j in [:blocksPerAuditor.toNat] do
+    let mut bCounter : UInt32 := 0
+    while blocks.size < blocksPerAuditor.toNat && bCounter < numBlocks do
       let mut input := coreSeed
       input := input ++ ByteArray.mk #[
+        ELVES_BLOCK_TAG,
         (auditorIdx &&& 0xFF).toUInt8,
         ((auditorIdx >>> 8) &&& 0xFF).toUInt8,
-        (j.toUInt32 &&& 0xFF).toUInt8,
-        ((j.toUInt32 >>> 8) &&& 0xFF).toUInt8
+        (bCounter &&& 0xFF).toUInt8,
+        ((bCounter >>> 8) &&& 0xFF).toUInt8
       ]
       let hash := (Jar.Crypto.blake2b input).data
       let blockIdx := (hash[0]!.toUInt32 ||| (hash[1]!.toUInt32 <<< 8)
@@ -294,6 +328,7 @@ def derive (vrfOutput : ByteArray) (coreIndex : UInt32)
         % numBlocks
       if !blocks.contains blockIdx then
         blocks := blocks.push blockIdx
+      bCounter := bCounter + 1
     assignedBlocks := assignedBlocks.push blocks
 
   { auditors, assignedBlocks, vrfOutput }

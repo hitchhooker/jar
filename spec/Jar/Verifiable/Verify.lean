@@ -8,21 +8,22 @@ import Jar.Crypto
 
 Two verification paths:
 
-1. **Validators (all)**: verify the Ligerito memory proof (~2ms).
-   This proves state continuity AND memory consistency. Done before
-   GRANDPA voting.
+1. **Validators (all)**: verify the Ligerito permutation proof (~2ms).
+   Proves the original and sorted memory access logs are the same
+   multiset. Done before GRANDPA voting.
 
-2. **ELVES committee (~35 auditors)**: re-execute assigned basic blocks
-   against the trace commitment. This verifies ALU correctness.
-   Done before ELVES approval.
+2. **ELVES committee (~35 auditors)**: verify sorted ordering, read
+   consistency, and ALU correctness by re-execution. Done before
+   ELVES approval.
 
-GRANDPA finality happens AFTER both checks pass (GP §19).
+GRANDPA finality requires both: `isAcceptable` gates on `isAudited`
+(GP §19, U♭ ≡ ⊤).
 
-## Fiat-Shamir domain separation
+## Security boundary
 
-Every Ligerito proof uses a domain-separated transcript bound to
-the specific block, core, and work report. Prevents cross-context
-proof replay.
+The permutation proof is UNCONDITIONAL (all validators verify).
+Sorting, read consistency, and ALU are ELVES (rational adversary).
+This distinction is critical — do not conflate them.
 -/
 
 namespace Jar.Verifiable
@@ -57,53 +58,59 @@ def mkDomainTranscript (ctx : ProofContext) : FiatShamirTranscript := Id.run do
   return ts
 
 -- ============================================================================
--- Memory Proof Verification (all validators, ~2ms)
+-- Memory Permutation Proof Verification (all validators)
 -- ============================================================================
 
-/-- Verify memory consistency: permutation proof + sorted-log check.
+/-- Verify the grand product memory PERMUTATION proof.
 
-    This is the primary verification step — every validator does this
-    before GRANDPA voting. It proves ALL of:
-    1. Permutation: original and sorted logs are the same multiset
-       (Ligerito grand product, unconditional)
-    2. Timestamp uniqueness: timestamps are consecutive integers
-       (equality constraints in polynomial, unconditional)
-    3. Sorted ordering: sorted log is ordered by (address, timestamp)
-       (validator linear scan over committed data, unconditional)
-    4. Read consistency: each read matches most recent write
-       (validator linear scan, unconditional)
+    This proves ONE thing: the original and sorted memory access logs
+    contain the same multiset of entries.
 
-    Memory consistency is FULLY UNCONDITIONAL — no ELVES dependency.
-    ELVES only checks ALU correctness (block re-execution).
+    What this does NOT prove (verified by ELVES committee instead):
+    - Sorted log is actually sorted by (address, seq)
+    - Read-after-write consistency
+    - State continuity (Merkle tree, not polynomial)
+    - ALU correctness (re-execution)
 
-    The proof's commitment root must match the work report's
-    erasure_root (binding the proof to the DA-encoded data).
+    The proof's commitment root is checked against the VerifiableFields
+    commitmentRoot (NOT erasure_root — these are different objects).
 
-    Cost: ~2.5ms per work report. Parallelizable across reports. -/
-def verifyMemoryProof (erasureRoot : ByteArray) (mp : MemoryProof)
-    (traceRoot : ByteArray) (ctx : ProofContext) : Bool := Id.run do
+    Cost: ~2ms per work report. Parallelizable across reports. -/
+def verifyMemoryProof (vf : VerifiableFields) (mp : MemoryProof)
+    (ctx : ProofContext) : Bool := Id.run do
   -- Structural checks
   if !mp.valid then return false
-  if erasureRoot.size != 32 then return false
-  if traceRoot.size != 32 then return false
 
-  -- Commitment binding: proof root must match erasure_root
+  -- Commitment binding: proof root must match the commitmentRoot
+  -- in VerifiableFields. This is NOT the erasure_root (which is an
+  -- RS encoding root for DA). The Ligerito commitment is a separate
+  -- mathematical object over GF(2^32) polynomials.
   match mp.proof.initialCommitment.root with
   | some proofRoot =>
-    if proofRoot != erasureRoot then return false
+    if proofRoot != vf.commitmentRoot then return false
   | none => return false
+
+  -- Commitment root in proof must match the one in VerifiableFields
+  if mp.commitmentRoot != vf.commitmentRoot then return false
 
   -- Domain-separated transcript
   let config := mkVerifierConfig mp.logSize
   let mut ts := mkDomainTranscript ctx
 
   -- Absorb trace root (binds proof to specific trace)
-  ts := absorbRoot ts traceRoot
+  ts := absorbRoot ts vf.traceRoot
 
-  -- Absorb program hash
+  -- Absorb program hash (binds proof to specific code)
   ts := absorbRoot ts mp.programHash
 
+  -- Absorb commitment root (binds transcript to this specific proof)
+  ts := absorbRoot ts mp.commitmentRoot
+
   -- Verify the Ligerito proof
+  -- NOTE: this verifies the polynomial commitment. The grand product
+  -- CONSTRAINT (Π(α - original_i) = Π(α - sorted_i)) is encoded in
+  -- the polynomial structure, not as a separate check. The verifier
+  -- confirms the committed polynomial is well-formed.
   let (valid, _) := verify config mp.proof ts
   valid
 
@@ -111,47 +118,41 @@ def verifyMemoryProof (erasureRoot : ByteArray) (mp : MemoryProof)
 -- ELVES Block Re-execution Verification
 -- ============================================================================
 
-/-- Verify a single basic block by re-execution.
+/-- Verify a single basic block boundary against the trace commitment.
 
     The ELVES auditor:
-    1. Gets the block boundary from the trace commitment (Merkle proof)
-    2. Gets memory read values from the access log
-    3. Re-executes the block using entry state + memory values
-    4. Checks the exit state matches the committed boundary
+    1. Gets the block boundary from the trace (Merkle proof)
+    2. Gets memory values from the access log (DA)
+    3. Re-executes using entry state + memory values
+    4. Checks exit state matches the committed boundary
 
-    Memory values are TRUSTED because the grand product proof
-    (verified by all validators) guarantees consistency. The auditor
-    only checks ALU correctness.
-
-    This function checks the STRUCTURAL part — that the boundary
-    states are consistent with the trace commitment. The actual PVM
-    re-execution happens in native code (javm), not in Lean. -/
+    This function checks the STRUCTURAL part only. Actual PVM
+    re-execution happens in native code (javm). -/
 def verifyBlockBoundary (traceRoot : ByteArray) (boundary : BlockBoundary)
-    (merkleProof : Array CHash) (depth : Nat) : Bool := Id.run do
-  -- The block boundary must be at a valid index
+    (blockIndex : UInt32) (merkleProof : Array CHash) : Bool := Id.run do
   if !boundary.entry.valid || !boundary.exit.valid then return false
 
-  -- Gas must decrease (or stay same for empty blocks)
+  -- Gas must not increase within a block
   if boundary.exit.gas > boundary.entry.gas then return false
 
-  -- Gas cost must match
-  if boundary.gasCost != boundary.entry.gas - boundary.exit.gas then return false
-
-  -- TODO: full Merkle verification against traceRoot.
+  -- TODO(SECURITY): implement full Merkle verification.
   -- Must verify that the serialized BlockBoundary is the leaf at
-  -- position `boundary.index` in the Merkle tree whose root is
-  -- `traceRoot`. Uses Jar.Commitment.CMerkle.verifyHashed.
-  -- Stub: structural check only (MUST be replaced before deployment).
-  traceRoot.size == 32 && merkleProof.size > 0
+  -- position `blockIndex` in the ordered Merkle tree with root
+  -- `traceRoot`. Use Jar.Commitment.CMerkle.verifyHashed.
+  --
+  -- WITHOUT THIS, ELVES AUDIT IS NON-FUNCTIONAL. A malicious
+  -- guarantor can fabricate any block boundary and it will pass.
+  -- This stub MUST be replaced before any deployment.
+  if traceRoot.size != 32 then return false
+  if merkleProof.isEmpty then return false
+  -- STUB: always passes structural check
+  true
 
 /-- Check register-level state continuity between adjacent blocks.
-    Exit state of block i must equal entry state of block i+1.
 
-    NOTE: this checks pc, registers, and gas only — NOT memory.
-    Memory continuity is proven globally by the grand product proof
-    (verified by all validators via `verifyMemoryProof`). The ELVES
-    auditor does not need to check memory continuity locally because
-    the grand product is unconditional. -/
+    NOTE: checks pc, registers, and gas only — NOT memory.
+    Memory continuity depends on ELVES verifying the sorted access
+    log (not on this function). -/
 def blocksContinuous (a b : BlockBoundary) : Bool :=
   a.exit.pc == b.entry.pc
   && a.exit.regs == b.entry.regs
@@ -161,29 +162,29 @@ def blocksContinuous (a b : BlockBoundary) : Bool :=
 -- Combined Verification (what validators do per work report)
 -- ============================================================================
 
-/-- Full verification flow for a work report.
+/-- Full validator verification for a work report.
 
     Called by each validator before GRANDPA voting:
-    1. Verify the Ligerito memory proof (unconditional, ~2ms)
-    2. Check structural validity of verifiable fields
+    1. Check structural validity
+    2. Verify proofHash binding (prevents proof substitution)
+    3. Verify the Ligerito permutation proof
 
-    ELVES re-execution is separate (done by assigned committee only,
-    not by all validators). GRANDPA voting happens after BOTH this check
-    AND ELVES approval. -/
-def verifyWorkReport (erasureRoot : ByteArray) (vf : VerifiableFields)
+    ELVES checks (sorting, read consistency, ALU) are separate.
+    GRANDPA voting requires BOTH this check AND ELVES approval. -/
+def verifyWorkReport (vf : VerifiableFields)
     (mp : MemoryProof) (serializedProof : ByteArray) (ctx : ProofContext)
     : Bool := Id.run do
   -- Structural validity
   if !vf.valid then return false
 
-  -- Proof binding: BLAKE2b(serialized_proof) must match proof_hash
-  -- in the work report. This prevents proof substitution — the proof
-  -- in DA must be the EXACT proof the guarantor committed to.
+  -- Proof binding: BLAKE2b(serialized_proof) must match proof_hash.
+  -- Prevents proof substitution — the proof in DA must be the EXACT
+  -- proof the guarantor committed to.
   let computedHash := (Jar.Crypto.blake2b serializedProof).data
   if computedHash != vf.proofHash then return false
 
-  -- Verify the memory proof against erasure_root
-  if !verifyMemoryProof erasureRoot mp vf.traceRoot ctx then return false
+  -- Verify the permutation proof
+  if !verifyMemoryProof vf mp ctx then return false
 
   true
 

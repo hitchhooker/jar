@@ -177,15 +177,11 @@ impl Pvm {
         if self.block_tracing_enabled {
             if let Some(entry) = self.block_entry_snapshot.take() {
                 let exit = self.snapshot();
-                let gas_cost = entry.gas.saturating_sub(exit.gas);
-                let index = self.block_trace.blocks.len() as u32;
                 self.block_trace.total_instructions += self.block_inst_count as u64;
                 self.block_trace.blocks.push(crate::trace::BlockStep {
-                    index,
                     entry,
                     exit,
                     instruction_count: self.block_inst_count,
-                    gas_cost,
                 });
             }
         }
