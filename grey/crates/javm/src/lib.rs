@@ -16,8 +16,10 @@ pub mod instruction;
 pub mod program;
 #[cfg(feature = "std")]
 pub mod recompiler;
+pub mod trace;
 pub mod vm;
 
+pub use trace::{BlockTrace, BlockStep, MemoryAccess, PvmSnapshot};
 pub use vm::{ExitReason, Pvm};
 #[cfg(feature = "std")]
 pub use recompiler::RecompiledPvm;
