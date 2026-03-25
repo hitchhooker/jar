@@ -89,6 +89,17 @@ pub struct Pvm {
     pub(crate) decoded_insts: Vec<DecodedInst>,
     /// Mapping from PC byte offset → instruction index. u32::MAX = invalid.
     pub(crate) pc_to_idx: Vec<u32>,
+
+    // --- Block trace fields (verifiable execution) ---
+
+    /// When true, collect basic block trace + memory access log.
+    pub block_tracing_enabled: bool,
+    /// Collected block trace (entry/exit state per basic block).
+    pub block_trace: crate::trace::BlockTrace,
+    /// Internal: entry snapshot for current basic block.
+    block_entry_snapshot: Option<crate::trace::PvmSnapshot>,
+    /// Internal: instruction count within current basic block.
+    block_inst_count: u32,
 }
 
 impl Pvm {
@@ -122,6 +133,10 @@ impl Pvm {
             pc_trace: Vec::new(),
             decoded_insts,
             pc_to_idx,
+            block_tracing_enabled: false,
+            block_trace: crate::trace::BlockTrace::new(),
+            block_entry_snapshot: None,
+            block_inst_count: 0,
         }
     }
 
@@ -131,6 +146,116 @@ impl Pvm {
         // This is a simplified mode; real programs use deblob.
         let bitmask = vec![1u8; code.len()];
         Self::new(code, bitmask, vec![], registers, flat_mem, gas)
+    }
+
+    // --- Block trace helpers ---
+
+    /// Take the collected block trace, replacing it with an empty one.
+    pub fn take_block_trace(&mut self) -> crate::trace::BlockTrace {
+        core::mem::take(&mut self.block_trace)
+    }
+
+    /// Capture a snapshot of the current PVM state.
+    fn snapshot(&self) -> crate::trace::PvmSnapshot {
+        crate::trace::PvmSnapshot {
+            pc: self.pc,
+            registers: self.registers,
+            gas: self.gas,
+        }
+    }
+
+    /// Called at basic block entry: save entry state.
+    fn trace_block_entry(&mut self) {
+        if self.block_tracing_enabled {
+            self.block_entry_snapshot = Some(self.snapshot());
+            self.block_inst_count = 0;
+        }
+    }
+
+    /// Called at basic block exit (terminator): emit BlockStep.
+    fn trace_block_exit(&mut self) {
+        if self.block_tracing_enabled {
+            if let Some(entry) = self.block_entry_snapshot.take() {
+                let exit = self.snapshot();
+                let gas_cost = entry.gas.saturating_sub(exit.gas);
+                let index = self.block_trace.blocks.len() as u32;
+                self.block_trace.total_instructions += self.block_inst_count as u64;
+                self.block_trace.blocks.push(crate::trace::BlockStep {
+                    index,
+                    entry,
+                    exit,
+                    instruction_count: self.block_inst_count,
+                    gas_cost,
+                });
+            }
+        }
+    }
+
+    // --- Traced memory accessors ---
+    // Wrap raw accessors to record accesses when block_tracing_enabled.
+
+    fn traced_read_u8(&mut self, addr: u32) -> Option<u8> {
+        let val = self.read_u8(addr)?;
+        if self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 1, false);
+        }
+        Some(val)
+    }
+
+    fn traced_read_u16_le(&mut self, addr: u32) -> Option<u16> {
+        let val = self.read_u16_le(addr)?;
+        if self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 2, false);
+        }
+        Some(val)
+    }
+
+    fn traced_read_u32_le(&mut self, addr: u32) -> Option<u32> {
+        let val = self.read_u32_le(addr)?;
+        if self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 4, false);
+        }
+        Some(val)
+    }
+
+    fn traced_read_u64_le(&mut self, addr: u32) -> Option<u64> {
+        let val = self.read_u64_le(addr)?;
+        if self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 8, false);
+        }
+        Some(val)
+    }
+
+    fn traced_write_u8(&mut self, addr: u32, val: u8) -> bool {
+        let ok = self.write_u8(addr, val);
+        if ok && self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 1, true);
+        }
+        ok
+    }
+
+    fn traced_write_u16_le(&mut self, addr: u32, val: u16) -> bool {
+        let ok = self.write_u16_le(addr, val);
+        if ok && self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 2, true);
+        }
+        ok
+    }
+
+    fn traced_write_u32_le(&mut self, addr: u32, val: u32) -> bool {
+        let ok = self.write_u32_le(addr, val);
+        if ok && self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val as u64, 4, true);
+        }
+        ok
+    }
+
+    fn traced_write_u64_le(&mut self, addr: u32, val: u64) -> bool {
+        let ok = self.write_u64_le(addr, val);
+        if ok && self.block_tracing_enabled {
+            self.block_trace.record_memory_access(addr, val, 8, true);
+        }
+        ok
     }
 
     // --- Flat memory accessors ---
@@ -313,6 +438,11 @@ impl Pvm {
             }
         };
 
+        // Block trace: record entry snapshot at block start.
+        if self.need_gas_charge {
+            self.trace_block_entry();
+        }
+
         // Per-basic-block gas metering (JAR v0.8.0).
         // Gas is charged at every block entry: initial entry, after terminators,
         // and at branch/jump targets. Matches Lean runBlockGas behavior.
@@ -371,7 +501,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u8(addr, imm_y as u8) { self.pc = next_pc; }
+                    if self.traced_write_u8(addr, imm_y as u8) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -379,7 +509,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u16_le(addr, imm_y as u16) { self.pc = next_pc; }
+                    if self.traced_write_u16_le(addr, imm_y as u16) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -387,7 +517,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u32_le(addr, imm_y as u32) { self.pc = next_pc; }
+                    if self.traced_write_u32_le(addr, imm_y as u32) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -395,7 +525,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u64_le(addr, imm_y) { self.pc = next_pc; }
+                    if self.traced_write_u64_le(addr, imm_y) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -428,7 +558,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -438,7 +568,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => { self.registers[ra] = v as i8 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -448,7 +578,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -458,7 +588,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => { self.registers[ra] = v as i16 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -468,7 +598,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -478,7 +608,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => { self.registers[ra] = v as i32 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -488,7 +618,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => { self.registers[ra] = v; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -498,7 +628,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u8(addr, self.registers[ra] as u8) { self.pc = next_pc; }
+                    if self.traced_write_u8(addr, self.registers[ra] as u8) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -506,7 +636,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u16_le(addr, self.registers[ra] as u16) { self.pc = next_pc; }
+                    if self.traced_write_u16_le(addr, self.registers[ra] as u16) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -514,7 +644,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u32_le(addr, self.registers[ra] as u32) { self.pc = next_pc; }
+                    if self.traced_write_u32_le(addr, self.registers[ra] as u32) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -522,7 +652,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u64_le(addr, self.registers[ra]) { self.pc = next_pc; }
+                    if self.traced_write_u64_le(addr, self.registers[ra]) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -532,7 +662,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u8(addr, imm_y as u8) { self.pc = next_pc; }
+                    if self.traced_write_u8(addr, imm_y as u8) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -540,7 +670,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u16_le(addr, imm_y as u16) { self.pc = next_pc; }
+                    if self.traced_write_u16_le(addr, imm_y as u16) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -548,7 +678,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u32_le(addr, imm_y as u32) { self.pc = next_pc; }
+                    if self.traced_write_u32_le(addr, imm_y as u32) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -556,7 +686,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u64_le(addr, imm_y) { self.pc = next_pc; }
+                    if self.traced_write_u64_le(addr, imm_y) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -728,7 +858,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u8(addr, self.registers[ra] as u8) { self.pc = next_pc; }
+                    if self.traced_write_u8(addr, self.registers[ra] as u8) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -736,7 +866,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u16_le(addr, self.registers[ra] as u16) { self.pc = next_pc; }
+                    if self.traced_write_u16_le(addr, self.registers[ra] as u16) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -744,7 +874,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u32_le(addr, self.registers[ra] as u32) { self.pc = next_pc; }
+                    if self.traced_write_u32_le(addr, self.registers[ra] as u32) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -752,7 +882,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u64_le(addr, self.registers[ra]) { self.pc = next_pc; }
+                    if self.traced_write_u64_le(addr, self.registers[ra]) { self.pc = next_pc; }
                     else { return Some(ExitReason::PageFault(addr & !0xFFF)); }
                 }
             }
@@ -760,7 +890,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -770,7 +900,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => { self.registers[ra] = v as i8 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -780,7 +910,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -790,7 +920,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => { self.registers[ra] = v as i16 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -800,7 +930,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => { self.registers[ra] = v as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -810,7 +940,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => { self.registers[ra] = v as i32 as i64 as u64; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -820,7 +950,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => { self.registers[ra] = v; self.pc = next_pc; }
                         None => return Some(ExitReason::PageFault(addr & !0xFFF)),
                     }
@@ -1436,9 +1566,15 @@ impl Pvm {
             }
         }
 
+        // Block trace: count instruction.
+        if self.block_tracing_enabled {
+            self.block_inst_count += 1;
+        }
+
         // After execution: if this instruction is a terminator, the next
         // instruction starts a new basic block and needs gas charging.
         if opcode.is_terminator() {
+            self.trace_block_exit();
             self.need_gas_charge = true;
         }
 
@@ -1458,7 +1594,7 @@ impl Pvm {
         let initial_gas = self.gas;
 
         // If tracing is enabled, fall back to the slow step-by-step path
-        if self.tracing_enabled {
+        if self.tracing_enabled || self.block_tracing_enabled {
             return self.run_stepping(initial_gas);
         }
 
@@ -2509,5 +2645,46 @@ mod tests {
         let mut vm = Pvm::new(code, bitmask, vec![], regs, Vec::new(), 100);
         vm.step();
         assert_eq!(vm.registers[0], 0xEFCDAB8967452301);
+    }
+
+    #[test]
+    fn test_block_trace_simple() {
+        // fallthrough then trap → two basic blocks
+        let mut vm = simple_vm(vec![1, 0], 100);
+        vm.block_tracing_enabled = true;
+        let (exit, _gas) = vm.run();
+        assert_eq!(exit, ExitReason::Panic);
+        let trace = vm.take_block_trace();
+        assert!(trace.num_blocks() > 0, "expected blocks, got 0");
+        assert!(trace.merkle_leaf_count() > 0);
+        assert!(trace.verify_continuity());
+    }
+
+    #[test]
+    fn test_memory_access_tracing() {
+        // Use store_u8 (opcode 59) which is OneRegOneImm: mem[rA + imm] = rA[7:0]
+        // With new_simple, every byte is an instruction start.
+        // store_u8: opcode=59, reg_byte=0x00 (rA=0), imm bytes (addr)
+        // load_u8:  opcode=52, reg_byte=0x00 (rD=0), imm bytes (addr)
+        //
+        // Actually, with all-1s bitmask the args decoding reads from zeta(pc+1)
+        // which IS the next byte. For OneRegOneImm: rA = zeta[pc+1] % 16.
+        // instruction length (l) = skip(pc) + 1, and with all bits=1, skip=0, so l=1.
+        // That means no immediate bytes (ly=0), so imm=0. The address is rA + 0.
+        //
+        // Simpler: just verify that the traced accessor infrastructure works
+        // by checking that traced_write_u8 records an access.
+        let mut vm = Pvm::new_simple(vec![0], [0; 13], vec![0u8; 256], 100);
+        vm.block_tracing_enabled = true;
+        // Manually call traced accessor
+        assert!(vm.traced_write_u8(0x10, 0x42));
+        assert_eq!(vm.traced_read_u8(0x10), Some(0x42));
+        let trace = vm.take_block_trace();
+        assert_eq!(trace.num_memory_accesses(), 2);
+        assert!(trace.memory_accesses[0].is_write);
+        assert!(!trace.memory_accesses[1].is_write);
+        assert_eq!(trace.memory_accesses[0].address, 0x10);
+        assert_eq!(trace.memory_accesses[1].value, 0x42);
+        assert!(trace.memory_accesses[1].seq > trace.memory_accesses[0].seq);
     }
 }
