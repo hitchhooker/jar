@@ -41,6 +41,12 @@ pub struct BlockStep {
     pub exit: PvmSnapshot,
     /// Number of instructions in this block.
     pub instruction_count: u32,
+    /// Range of memory access seq numbers belonging to this block.
+    /// `access_seq_start..access_seq_end` indexes into the memory
+    /// access log. Enables ELVES auditors to extract the subset of
+    /// accesses for a specific block without re-executing from block 0.
+    pub access_seq_start: u32,
+    pub access_seq_end: u32,
 }
 
 impl BlockStep {
@@ -65,6 +71,22 @@ pub struct MemoryAccess {
     pub width: u8,
     /// True if store, false if load.
     pub is_write: bool,
+}
+
+impl MemoryAccess {
+    /// Encode this access as 6 GF(2^32) elements for the polynomial.
+    /// Layout: [addr, value_lo, value_hi, seq, width, flags]
+    /// This is the canonical encoding — both prover and verifier use it.
+    pub fn to_field_elements(&self) -> [u32; 6] {
+        [
+            self.address,
+            self.value as u32,         // value_lo: low 32 bits
+            (self.value >> 32) as u32, // value_hi: high 32 bits
+            self.seq,
+            self.width as u32,         // 1, 2, 4, or 8
+            if self.is_write { 1 } else { 0 },
+        ]
+    }
 }
 
 /// Complete trace for a single work report execution.
@@ -118,6 +140,11 @@ impl BlockTrace {
         });
         self.next_seq += 1;
         true
+    }
+
+    /// Current sequence number (next access will get this seq).
+    pub fn current_seq(&self) -> u32 {
+        self.next_seq
     }
 
     /// Number of memory accesses recorded.

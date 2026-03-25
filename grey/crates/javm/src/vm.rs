@@ -100,6 +100,8 @@ pub struct Pvm {
     block_entry_snapshot: Option<crate::trace::PvmSnapshot>,
     /// Internal: instruction count within current basic block.
     block_inst_count: u32,
+    /// Internal: seq number at start of current basic block's accesses.
+    block_access_seq_start: u32,
 }
 
 impl Pvm {
@@ -137,6 +139,7 @@ impl Pvm {
             block_trace: crate::trace::BlockTrace::new(),
             block_entry_snapshot: None,
             block_inst_count: 0,
+            block_access_seq_start: 0,
         }
     }
 
@@ -164,11 +167,13 @@ impl Pvm {
         }
     }
 
-    /// Called at basic block entry: save entry state.
+    /// Called at basic block entry: save entry state and access seq.
     fn trace_block_entry(&mut self) {
         if self.block_tracing_enabled {
             self.block_entry_snapshot = Some(self.snapshot());
             self.block_inst_count = 0;
+            // Record the current seq as the start of this block's accesses
+            self.block_access_seq_start = self.block_trace.current_seq();
         }
     }
 
@@ -182,6 +187,8 @@ impl Pvm {
                     entry,
                     exit,
                     instruction_count: self.block_inst_count,
+                    access_seq_start: self.block_access_seq_start,
+                    access_seq_end: self.block_trace.current_seq(),
                 });
             }
         }
@@ -190,66 +197,78 @@ impl Pvm {
     // --- Traced memory accessors ---
     // Wrap raw accessors to record accesses when block_tracing_enabled.
 
+    // Traced memory accessors: wrap raw accessors + record in trace.
+    // If the trace seq counter overflows (>2^32 accesses), return
+    // None/false to halt execution (treated as page fault by step()).
+
     fn traced_read_u8(&mut self, addr: u32) -> Option<u8> {
         let val = self.read_u8(addr)?;
-        if self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 1, false);
+        if self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 1, false) {
+            return None; // trace overflow → abort
         }
         Some(val)
     }
 
     fn traced_read_u16_le(&mut self, addr: u32) -> Option<u16> {
         let val = self.read_u16_le(addr)?;
-        if self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 2, false);
+        if self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 2, false) {
+            return None;
         }
         Some(val)
     }
 
     fn traced_read_u32_le(&mut self, addr: u32) -> Option<u32> {
         let val = self.read_u32_le(addr)?;
-        if self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 4, false);
+        if self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 4, false) {
+            return None;
         }
         Some(val)
     }
 
     fn traced_read_u64_le(&mut self, addr: u32) -> Option<u64> {
         let val = self.read_u64_le(addr)?;
-        if self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 8, false);
+        if self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 8, false) {
+            return None;
         }
         Some(val)
     }
 
     fn traced_write_u8(&mut self, addr: u32, val: u8) -> bool {
         let ok = self.write_u8(addr, val);
-        if ok && self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 1, true);
+        if ok && self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 1, true) {
+            return false; // trace overflow → abort
         }
         ok
     }
 
     fn traced_write_u16_le(&mut self, addr: u32, val: u16) -> bool {
         let ok = self.write_u16_le(addr, val);
-        if ok && self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 2, true);
+        if ok && self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 2, true) {
+            return false;
         }
         ok
     }
 
     fn traced_write_u32_le(&mut self, addr: u32, val: u32) -> bool {
         let ok = self.write_u32_le(addr, val);
-        if ok && self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val as u64, 4, true);
+        if ok && self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val as u64, 4, true) {
+            return false;
         }
         ok
     }
 
     fn traced_write_u64_le(&mut self, addr: u32, val: u64) -> bool {
         let ok = self.write_u64_le(addr, val);
-        if ok && self.block_tracing_enabled {
-            self.block_trace.record_memory_access(addr, val, 8, true);
+        if ok && self.block_tracing_enabled
+            && !self.block_trace.record_memory_access(addr, val, 8, true) {
+            return false;
         }
         ok
     }

@@ -45,6 +45,8 @@ pub enum NetworkEvent {
     AnnouncementReceived { data: Vec<u8>, source: PeerId },
     /// A ticket proof was received from a peer.
     TicketReceived { data: Vec<u8>, source: PeerId },
+    /// An ELVES audit approval was received from a peer.
+    ApprovalReceived { data: Vec<u8>, source: PeerId },
     /// A chunk fetch request was received.
     ChunkRequest {
         report_hash: [u8; 32],
@@ -484,6 +486,11 @@ async fn run_network_loop(
                             });
                         } else if topic == TICKETS_TOPIC {
                             let _ = event_tx.send(NetworkEvent::TicketReceived {
+                                data: message.data,
+                                source: propagation_source,
+                            });
+                        } else if topic == APPROVALS_TOPIC {
+                            let _ = event_tx.send(NetworkEvent::ApprovalReceived {
                                 data: message.data,
                                 source: propagation_source,
                             });

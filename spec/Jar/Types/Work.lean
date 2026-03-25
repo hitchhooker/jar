@@ -123,6 +123,12 @@ structure WorkReport where
   digests : Array WorkDigest
   /-- g : Authorization gas used. ℕ_G. -/
   authGasUsed : Gas
+  /-- Verifiable execution fields (optional, for cores with proofs).
+      traceRoot: Merkle root over block boundary states
+      proofHash: BLAKE2b of serialized Ligerito proof
+      commitmentRoot: Ligerito polynomial commitment root (NOT erasure_root)
+      NOT part of GP v0.7.2 — extension for verifiable execution. -/
+  verifiable : Option (Hash × Hash × Hash) := none
 
 -- ============================================================================
 -- §11.1 — Reporting State (eq:reportingstate)

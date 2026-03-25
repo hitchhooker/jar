@@ -185,10 +185,6 @@ structure MemoryProof where
   numAccesses : UInt32
   /-- Program hash (binds proof to specific code). -/
   programHash : ByteArray
-  /-- Ligerito commitment root. This is NOT the erasure_root —
-      it is a separate commitment over the GF(2^32) polynomial.
-      Must be verified independently from the DA erasure root. -/
-  commitmentRoot : ByteArray
 
 instance : Inhabited MemoryProof where
   default := {
@@ -203,14 +199,12 @@ instance : Inhabited MemoryProof where
     logSize := 20
     numAccesses := 0
     programHash := ByteArray.mk #[]
-    commitmentRoot := ByteArray.mk #[]
   }
 
 namespace MemoryProof
 
 def valid (mp : MemoryProof) : Bool :=
   mp.programHash.size == 32
-  && mp.commitmentRoot.size == 32
   && mp.logSize >= 20
   && mp.logSize <= MAX_LOG_SIZE
 

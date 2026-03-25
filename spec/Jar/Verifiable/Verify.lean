@@ -81,17 +81,15 @@ def verifyMemoryProof (vf : VerifiableFields) (mp : MemoryProof)
   -- Structural checks
   if !mp.valid then return false
 
-  -- Commitment binding: proof root must match the commitmentRoot
-  -- in VerifiableFields. This is NOT the erasure_root (which is an
-  -- RS encoding root for DA). The Ligerito commitment is a separate
-  -- mathematical object over GF(2^32) polynomials.
+  -- Commitment binding: the Ligerito proof's commitment root must
+  -- match commitmentRoot in VerifiableFields. This is NOT the
+  -- erasure_root (which is an RS encoding root for DA). The Ligerito
+  -- commitment is a separate mathematical object over GF(2^32).
+  -- Single source of truth: extracted from the proof itself.
   match mp.proof.initialCommitment.root with
   | some proofRoot =>
     if proofRoot != vf.commitmentRoot then return false
   | none => return false
-
-  -- Commitment root in proof must match the one in VerifiableFields
-  if mp.commitmentRoot != vf.commitmentRoot then return false
 
   -- Domain-separated transcript
   let config := mkVerifierConfig mp.logSize
@@ -102,9 +100,6 @@ def verifyMemoryProof (vf : VerifiableFields) (mp : MemoryProof)
 
   -- Absorb program hash (binds proof to specific code)
   ts := absorbRoot ts mp.programHash
-
-  -- Absorb commitment root (binds transcript to this specific proof)
-  ts := absorbRoot ts mp.commitmentRoot
 
   -- Verify the Ligerito proof
   -- NOTE: this verifies the polynomial commitment. The grand product
