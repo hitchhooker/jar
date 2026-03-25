@@ -432,5 +432,95 @@ fn bench_ecrecover(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_fib, bench_hostcall, bench_sort, bench_ecrecover);
+// ---------------------------------------------------------------------------
+// Trace overhead benchmarks
+// ---------------------------------------------------------------------------
+
+/// Run grey interpreter with block tracing enabled (trace + memory log).
+fn run_grey_with_tracing(blob: &[u8]) -> (u64, u64, usize, usize) {
+    let mut pvm = javm::program::initialize_program(blob, &[], GAS_LIMIT).unwrap();
+    pvm.block_tracing_enabled = true;
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            javm::ExitReason::Halt => break,
+            javm::ExitReason::HostCall(_) => continue,
+            other => panic!("unexpected exit: {:?}", other),
+        }
+    }
+    let trace = pvm.take_block_trace();
+    let result = pvm.registers[7];
+    let consumed = GAS_LIMIT - pvm.gas;
+    (result, consumed, trace.num_blocks(), trace.num_memory_accesses())
+}
+
+fn bench_trace_overhead(c: &mut Criterion) {
+    let fib_blob = grey_fib_blob(FIB_N);
+    let sort_blob = grey_sort_blob(SORT_N);
+
+    // Validate tracing produces same results
+    let (fib_r, fib_g) = run_grey_interpreter(&fib_blob);
+    let (fib_tr, fib_tg, fib_blocks, fib_accesses) = run_grey_with_tracing(&fib_blob);
+    assert_eq!(fib_r, fib_tr, "fib: tracing changed result");
+    assert_eq!(fib_g, fib_tg, "fib: tracing changed gas");
+    eprintln!("fib trace: {} blocks, {} memory accesses", fib_blocks, fib_accesses);
+
+    let (sort_r, sort_g) = run_grey_interpreter(&sort_blob);
+    let (sort_tr, sort_tg, sort_blocks, sort_accesses) = run_grey_with_tracing(&sort_blob);
+    assert_eq!(sort_r, sort_tr, "sort: tracing changed result");
+    assert_eq!(sort_g, sort_tg, "sort: tracing changed gas");
+    eprintln!("sort trace: {} blocks, {} memory accesses", sort_blocks, sort_accesses);
+
+    let mut group = c.benchmark_group("trace_overhead");
+
+    // Compare: fast path (pre-decoded) vs stepping (no trace) vs stepping (with trace)
+    // The interesting overhead is stepping+trace vs stepping-only.
+    // Fast path vs stepping is ~20x — that's the interpreter overhead, not trace cost.
+
+    group.bench_function("fib/fast-path", |b| {
+        b.iter(|| run_grey_interpreter(&fib_blob))
+    });
+    group.bench_function("fib/stepping-no-trace", |b| {
+        b.iter(|| {
+            let mut pvm = javm::program::initialize_program(&fib_blob, &[], GAS_LIMIT).unwrap();
+            pvm.tracing_enabled = true; // forces stepping path WITHOUT block trace
+            loop {
+                let (exit, _) = pvm.run();
+                match exit {
+                    javm::ExitReason::Halt => break,
+                    javm::ExitReason::HostCall(_) => continue,
+                    other => panic!("unexpected exit: {:?}", other),
+                }
+            }
+        })
+    });
+    group.bench_function("fib/stepping-with-trace", |b| {
+        b.iter(|| run_grey_with_tracing(&fib_blob))
+    });
+
+    group.bench_function("sort/fast-path", |b| {
+        b.iter(|| run_grey_interpreter(&sort_blob))
+    });
+    group.bench_function("sort/stepping-no-trace", |b| {
+        b.iter(|| {
+            let mut pvm = javm::program::initialize_program(&sort_blob, &[], GAS_LIMIT).unwrap();
+            pvm.tracing_enabled = true;
+            loop {
+                let (exit, _) = pvm.run();
+                match exit {
+                    javm::ExitReason::Halt => break,
+                    javm::ExitReason::HostCall(_) => continue,
+                    other => panic!("unexpected exit: {:?}", other),
+                }
+            }
+        })
+    });
+    group.bench_function("sort/stepping-with-trace", |b| {
+        b.iter(|| run_grey_with_tracing(&sort_blob))
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_fib, bench_hostcall, bench_sort, bench_ecrecover, bench_trace_overhead);
 criterion_main!(benches);
