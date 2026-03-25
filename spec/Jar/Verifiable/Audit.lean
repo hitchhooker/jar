@@ -81,6 +81,7 @@ def validateAuditInputs (traceRoot : ByteArray)
     (assignedBlocks : Array BlockBoundary)
     (blockIndices : Array UInt32)
     (merkleProofs : Array (Array CHash))
+    (treeDepth : Nat)
     : AuditResult := Id.run do
   if assignedBlocks.isEmpty then
     return AuditResult.unavailable "no blocks assigned"
@@ -108,7 +109,7 @@ def validateAuditInputs (traceRoot : ByteArray)
     let proof := if i < merkleProofs.size then merkleProofs[i]! else #[]
 
     -- Verify block boundary is in the trace at its claimed index
-    if !verifyBlockBoundary traceRoot block idx proof then
+    if !verifyBlockBoundary traceRoot block idx proof treeDepth then
       return AuditResult.invalid s!"block {idx} boundary verification failed"
 
     -- Check state continuity between consecutively-indexed blocks

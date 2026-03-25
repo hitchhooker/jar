@@ -51,10 +51,10 @@ structure ProofContext where
 /-- Initialize a domain-separated transcript. -/
 def mkDomainTranscript (ctx : ProofContext) : FiatShamirTranscript := Id.run do
   let mut ts := mkTranscript 0
-  ts := absorbRoot ts "jar-verifiable-execution-v1".toUTF8
-  ts := absorbRoot ts ctx.blockHash
+  ts := absorbLabeled ts "domain" "jar-verifiable-execution-v1".toUTF8
+  ts := absorbLabeled ts "block_hash" ctx.blockHash
   ts := absorbGF32 ts ctx.coreIndex
-  ts := absorbRoot ts ctx.workReportHash
+  ts := absorbLabeled ts "work_report_hash" ctx.workReportHash
   return ts
 
 -- ============================================================================
@@ -95,11 +95,10 @@ def verifyMemoryProof (vf : VerifiableFields) (mp : MemoryProof)
   let config := mkVerifierConfig mp.logSize
   let mut ts := mkDomainTranscript ctx
 
-  -- Absorb trace root (binds proof to specific trace)
-  ts := absorbRoot ts vf.traceRoot
-
-  -- Absorb program hash (binds proof to specific code)
-  ts := absorbRoot ts mp.programHash
+  -- Absorb with distinct labels to prevent reordering attacks.
+  -- Each field gets a unique label in the Fiat-Shamir transcript.
+  ts := absorbLabeled ts "trace_root" vf.traceRoot
+  ts := absorbLabeled ts "program_hash" mp.programHash
 
   -- Verify the Ligerito proof
   -- NOTE: this verifies the polynomial commitment. The grand product
@@ -123,25 +122,55 @@ def verifyMemoryProof (vf : VerifiableFields) (mp : MemoryProof)
 
     This function checks the STRUCTURAL part only. Actual PVM
     re-execution happens in native code (javm). -/
+/-- Serialize a PvmSnapshot to bytes for Merkle leaf hashing.
+    Layout: pc(4 LE) || regs[0..12](8 LE each) || gas(8 LE) = 116 bytes -/
+def serializeSnapshot (s : PvmSnapshot) : ByteArray := Id.run do
+  let mut buf := ByteArray.mk #[]
+  -- pc: 4 bytes LE
+  buf := buf ++ ByteArray.mk #[
+    (s.pc &&& 0xFF).toUInt8, ((s.pc >>> 8) &&& 0xFF).toUInt8,
+    ((s.pc >>> 16) &&& 0xFF).toUInt8, ((s.pc >>> 24) &&& 0xFF).toUInt8]
+  -- regs: 13 × 8 bytes LE
+  for r in s.regs do
+    for shift in [0, 8, 16, 24, 32, 40, 48, 56] do
+      buf := buf.push ((r >>> shift.toUInt64) &&& 0xFF).toUInt8
+  -- gas: 8 bytes LE
+  for shift in [0, 8, 16, 24, 32, 40, 48, 56] do
+    buf := buf.push ((s.gas >>> shift.toUInt64) &&& 0xFF).toUInt8
+  buf
+
+/-- Serialize a BlockBoundary to bytes for Merkle leaf hashing.
+    Layout: entry_snapshot || exit_snapshot || instructionCount(4 LE) -/
+def serializeBoundary (b : BlockBoundary) : ByteArray :=
+  let entry := serializeSnapshot b.entry
+  let exit := serializeSnapshot b.exit
+  let ic := b.instructionCount
+  entry ++ exit ++ ByteArray.mk #[
+    (ic &&& 0xFF).toUInt8, ((ic >>> 8) &&& 0xFF).toUInt8,
+    ((ic >>> 16) &&& 0xFF).toUInt8, ((ic >>> 24) &&& 0xFF).toUInt8]
+
+/-- Hash a serialized BlockBoundary into a Merkle leaf.
+    Uses BLAKE2b to match the trace Merkle tree construction. -/
+def hashBoundaryLeaf (b : BlockBoundary) : CHash :=
+  (Jar.Crypto.blake2b (serializeBoundary b)).data
+
 def verifyBlockBoundary (traceRoot : ByteArray) (boundary : BlockBoundary)
-    (blockIndex : UInt32) (merkleProof : Array CHash) : Bool := Id.run do
+    (blockIndex : UInt32) (merkleProof : Array CHash) (depth : Nat)
+    : Bool := Id.run do
   if !boundary.entry.valid || !boundary.exit.valid then return false
 
   -- Gas must not increase within a block
   if boundary.exit.gas > boundary.entry.gas then return false
 
-  -- TODO(SECURITY): implement full Merkle verification.
-  -- Must verify that the serialized BlockBoundary is the leaf at
-  -- position `blockIndex` in the ordered Merkle tree with root
-  -- `traceRoot`. Use Jar.Commitment.CMerkle.verifyHashed.
-  --
-  -- WITHOUT THIS, ELVES AUDIT IS NON-FUNCTIONAL. A malicious
-  -- guarantor can fabricate any block boundary and it will pass.
-  -- This stub MUST be replaced before any deployment.
   if traceRoot.size != 32 then return false
-  if merkleProof.isEmpty then return false
-  -- STUB: always passes structural check
-  true
+
+  -- Hash the boundary into a Merkle leaf
+  let leafHash := hashBoundaryLeaf boundary
+
+  -- Verify Merkle inclusion: this boundary is at position blockIndex
+  -- in the ordered Merkle tree whose root is traceRoot.
+  verifyHashed (some traceRoot) merkleProof depth
+    #[leafHash] #[blockIndex.toNat]
 
 /-- Check register-level state continuity between adjacent blocks.
 

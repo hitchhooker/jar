@@ -157,10 +157,16 @@ end TraceCommitment
 -- Memory Consistency Proof
 -- ============================================================================
 
+/-- Minimum log₂ polynomial size for Ligerito verification.
+    Derived from mkVerifierConfig: logSize - 6 >= 4 + 1 → logSize >= 11.
+    We use 14 as floor (initialDimLog=8, recursiveDimLog=4) to ensure
+    sufficient security margin in the sumcheck protocol. -/
+def MIN_LOG_SIZE : Nat := 14
+
 /-- Maximum log₂ polynomial size accepted by validators.
-    Limits verifier work. Programs exceeding this must split proofs
-    or fall back to pure ELVES re-execution. -/
-def MAX_LOG_SIZE : Nat := 24  -- 2^24 = 16M elements
+    At 12 elements per access, 2^24 supports ~1.4M accesses.
+    Programs exceeding this must split proofs or use pure ELVES. -/
+def MAX_LOG_SIZE : Nat := 24
 
 /-- Grand product memory permutation proof (Ligerito).
 
@@ -205,7 +211,7 @@ namespace MemoryProof
 
 def valid (mp : MemoryProof) : Bool :=
   mp.programHash.size == 32
-  && mp.logSize >= 20
+  && mp.logSize >= MIN_LOG_SIZE
   && mp.logSize <= MAX_LOG_SIZE
 
 end MemoryProof
@@ -262,7 +268,7 @@ namespace ELVESAssignment
 
     Domain separation: committee selection uses tag 0x01, block
     assignment uses tag 0x02, preventing hash input collisions
-    (Komlo review). -/
+    preventing hash input collisions between the two domains. -/
 def derive (vrfOutput : ByteArray) (coreIndex : UInt32)
     (numValidators numBlocks : UInt32)
     (committeeSize blocksPerAuditor : UInt32)

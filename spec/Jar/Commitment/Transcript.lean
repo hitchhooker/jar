@@ -32,6 +32,20 @@ def mkTranscript (seed : Int) : FiatShamirTranscript :=
   ]
   { buffer := seedBytes, counter := 0 }
 
+/-- Absorb labeled bytes into the transcript. Each absorption uses
+    a distinct label to prevent reordering attacks. -/
+def absorbLabeled (ts : FiatShamirTranscript) (labelStr : String) (data : ByteArray)
+    : FiatShamirTranscript :=
+  let label := labelStr.toUTF8
+  let lenBytes := ByteArray.mk #[
+    (data.size &&& 0xFF).toUInt8,
+    ((data.size >>> 8) &&& 0xFF).toUInt8,
+    ((data.size >>> 16) &&& 0xFF).toUInt8,
+    ((data.size >>> 24) &&& 0xFF).toUInt8,
+    0, 0, 0, 0
+  ]
+  { ts with buffer := ts.buffer ++ label ++ lenBytes ++ data }
+
 /-- Absorb a Merkle root into the transcript. -/
 def absorbRoot (ts : FiatShamirTranscript) (root : ByteArray) : FiatShamirTranscript :=
   let label := "merkle_root".toUTF8

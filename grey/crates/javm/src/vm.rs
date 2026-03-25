@@ -204,7 +204,7 @@ impl Pvm {
     fn traced_read_u8(&mut self, addr: u32) -> Option<u8> {
         let val = self.read_u8(addr)?;
         if self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 1, false) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte1, false) {
             return None; // trace overflow → abort
         }
         Some(val)
@@ -213,7 +213,7 @@ impl Pvm {
     fn traced_read_u16_le(&mut self, addr: u32) -> Option<u16> {
         let val = self.read_u16_le(addr)?;
         if self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 2, false) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte2, false) {
             return None;
         }
         Some(val)
@@ -222,7 +222,7 @@ impl Pvm {
     fn traced_read_u32_le(&mut self, addr: u32) -> Option<u32> {
         let val = self.read_u32_le(addr)?;
         if self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 4, false) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte4, false) {
             return None;
         }
         Some(val)
@@ -231,7 +231,7 @@ impl Pvm {
     fn traced_read_u64_le(&mut self, addr: u32) -> Option<u64> {
         let val = self.read_u64_le(addr)?;
         if self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 8, false) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte8, false) {
             return None;
         }
         Some(val)
@@ -240,7 +240,7 @@ impl Pvm {
     fn traced_write_u8(&mut self, addr: u32, val: u8) -> bool {
         let ok = self.write_u8(addr, val);
         if ok && self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 1, true) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte1, true) {
             return false; // trace overflow → abort
         }
         ok
@@ -249,7 +249,7 @@ impl Pvm {
     fn traced_write_u16_le(&mut self, addr: u32, val: u16) -> bool {
         let ok = self.write_u16_le(addr, val);
         if ok && self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 2, true) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte2, true) {
             return false;
         }
         ok
@@ -258,7 +258,7 @@ impl Pvm {
     fn traced_write_u32_le(&mut self, addr: u32, val: u32) -> bool {
         let ok = self.write_u32_le(addr, val);
         if ok && self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val as u64, 4, true) {
+            && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte4, true) {
             return false;
         }
         ok
@@ -267,7 +267,7 @@ impl Pvm {
     fn traced_write_u64_le(&mut self, addr: u32, val: u64) -> bool {
         let ok = self.write_u64_le(addr, val);
         if ok && self.block_tracing_enabled
-            && !self.block_trace.record_memory_access(addr, val, 8, true) {
+            && !self.block_trace.record_memory_access(addr, val, crate::trace::AccessWidth::Byte8, true) {
             return false;
         }
         ok

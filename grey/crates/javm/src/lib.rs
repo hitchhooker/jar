@@ -19,7 +19,7 @@ pub mod recompiler;
 pub mod trace;
 pub mod vm;
 
-pub use trace::{BlockTrace, BlockStep, MemoryAccess, PvmSnapshot};
+pub use trace::{AccessWidth, BlockTrace, BlockStep, MemoryAccess, PvmSnapshot};
 pub use vm::{ExitReason, Pvm};
 #[cfg(feature = "std")]
 pub use recompiler::RecompiledPvm;

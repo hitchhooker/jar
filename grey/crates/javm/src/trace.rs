@@ -56,6 +56,34 @@ impl BlockStep {
     }
 }
 
+/// Access width in bytes. Matches PVM load/store instruction widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AccessWidth {
+    Byte1 = 1,
+    Byte2 = 2,
+    Byte4 = 4,
+    Byte8 = 8,
+}
+
+impl AccessWidth {
+    /// Convert from raw byte count. Returns None for invalid widths.
+    pub fn from_bytes(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(Self::Byte1),
+            2 => Some(Self::Byte2),
+            4 => Some(Self::Byte4),
+            8 => Some(Self::Byte8),
+            _ => None,
+        }
+    }
+
+    /// Raw byte count (1, 2, 4, or 8).
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 /// A single memory access during PVM execution.
 /// Recorded for the grand product permutation proof.
 #[derive(Clone, Debug)]
@@ -67,8 +95,8 @@ pub struct MemoryAccess {
     /// Monotonic sequence number (execution order, 0-based).
     /// The polynomial constrains seq_i == i for uniqueness.
     pub seq: u32,
-    /// Width of access in bytes (1, 2, 4, or 8).
-    pub width: u8,
+    /// Width of access (1, 2, 4, or 8 bytes).
+    pub width: AccessWidth,
     /// True if store, false if load.
     pub is_write: bool,
 }
@@ -83,7 +111,7 @@ impl MemoryAccess {
             self.value as u32,         // value_lo: low 32 bits
             (self.value >> 32) as u32, // value_hi: high 32 bits
             self.seq,
-            self.width as u32,         // 1, 2, 4, or 8
+            self.width.as_u32(),       // 1, 2, 4, or 8
             if self.is_write { 1 } else { 0 },
         ]
     }
@@ -126,7 +154,7 @@ impl BlockTrace {
     /// Returns false if the sequence counter would overflow (>2^32
     /// accesses). Callers should treat this as a trace abort.
     pub fn record_memory_access(
-        &mut self, address: u32, value: u64, width: u8, is_write: bool,
+        &mut self, address: u32, value: u64, width: AccessWidth, is_write: bool,
     ) -> bool {
         if self.next_seq == u32::MAX {
             return false; // overflow: trace is full
@@ -174,14 +202,11 @@ impl BlockTrace {
     }
 
     /// Log₂ of the polynomial size for the grand product proof.
-    /// Minimum 20 (2^20), maximum 24 (2^24).
+    /// Minimum 14 (Ligerito needs logSize-6 >= 4+1), maximum 24.
     pub fn log_size(&self) -> u32 {
         let n = self.polynomial_elements().next_power_of_two();
-        if n == 0 {
-            20
-        } else {
-            n.trailing_zeros().max(20).min(24)
-        }
+        // next_power_of_two(0) = 1, trailing_zeros(1) = 0
+        n.trailing_zeros().max(14).min(24)
     }
 
     /// Verify internal consistency: each block's exit matches the
