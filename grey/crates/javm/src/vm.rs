@@ -464,6 +464,7 @@ impl Pvm {
         if self.need_gas_charge {
             let block_cost = self.block_gas_costs[pc];
             if self.gas < block_cost {
+                self.trace_block_exit(); // emit partial block
                 return Some(ExitReason::OutOfGas);
             }
             self.gas -= block_cost;
@@ -497,8 +498,9 @@ impl Pvm {
             // === A.5.2: One immediate ===
             Opcode::Ecalli => {
                 if let Args::Imm { imm } = args {
-                    // Advance PC to next instruction before returning (eq A.9)
                     self.pc = next_pc;
+                    // Emit block before returning for host call
+                    self.trace_block_exit();
                     return Some(ExitReason::HostCall(imm as u32));
                 }
             }
@@ -1650,6 +1652,18 @@ impl Pvm {
                     self.block_access_seq_start = self.block_trace.current_seq();
                 }
                 if self.gas < inst.bb_gas_cost {
+                    // Emit the partial block (entry captured, no instructions executed)
+                    if self.block_tracing_enabled {
+                        if let Some(entry) = self.block_entry_snapshot.take() {
+                            let exit_snap = self.snapshot();
+                            self.block_trace.blocks.push(crate::trace::BlockStep {
+                                entry, exit: exit_snap,
+                                instruction_count: 0,
+                                access_seq_start: self.block_access_seq_start,
+                                access_seq_end: self.block_trace.current_seq(),
+                            });
+                        }
+                    }
                     self.pc = inst.pc;
                     return (ExitReason::OutOfGas, initial_gas - self.gas);
                 }
@@ -1675,6 +1689,22 @@ impl Pvm {
 
                 // === One immediate ===
                 Opcode::Ecalli => {
+                    // Emit block BEFORE returning for host call.
+                    // Ecalli is the last instruction of its block.
+                    if self.block_tracing_enabled {
+                        self.block_inst_count += 1;
+                        if let Some(entry) = self.block_entry_snapshot.take() {
+                            self.pc = next_pc; // capture exit pc after ecalli
+                            let exit_snap = self.snapshot();
+                            self.block_trace.total_instructions += self.block_inst_count as u64;
+                            self.block_trace.blocks.push(crate::trace::BlockStep {
+                                entry, exit: exit_snap,
+                                instruction_count: self.block_inst_count,
+                                access_seq_start: self.block_access_seq_start,
+                                access_seq_end: self.block_trace.current_seq(),
+                            });
+                        }
+                    }
                     self.pc = next_pc;
                     return (ExitReason::HostCall(imm1 as u32), initial_gas - self.gas);
                 }
