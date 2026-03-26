@@ -1,6 +1,7 @@
 import Jar.Verifiable.Types
 import Jar.Verifiable.Verify
 import Jar.Verifiable.Audit
+import Jar.Verifiable.GrandProduct
 
 /-!
 # Verifiable Execution on JAM
@@ -22,13 +23,16 @@ re-executing assigned blocks. BLS finality follows ELVES approval.
   MemoryProof, VerifiableFields, ELVESAssignment
 - `Verify`: verifyMemoryProof, verifyBlockBoundary, verifyWorkReport,
   ProofContext (Fiat-Shamir domain separation)
-- `Audit`: validatorAudit, elvesAudit, ELVESParams, FinalityTimeline
+- `Audit`: validateAuditInputs
+- `GrandProduct`: logarithmic derivative permutation argument,
+  tuple compression (β challenge), seq constraint, verifyGrandProduct
 
 ## Security
 
-Memory consistency: unconditional (Ligerito grand product).
+Memory permutation: unconditional (logarithmic derivative over GF(2^128)).
+Sorting + read consistency: ELVES (rational adversary).
 ALU correctness: ELVES rational-adversary (eprint 2024/961).
-Finality: BLS aggregation after ELVES approval (6-12s at 2s slots).
+Finality: GRANDPA after ELVES approval (3-4.5s at 1.5s slots).
 
 See DESIGN.md (repo root) for full rationale.
 -/
