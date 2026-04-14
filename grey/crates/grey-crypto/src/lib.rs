@@ -10,6 +10,7 @@ pub mod bandersnatch;
 pub mod blake2b;
 pub mod bls;
 pub mod ed25519;
+pub mod proximity;
 pub mod keccak;
 pub mod shuffle;
 

@@ -102,6 +102,11 @@ structure RefinementContext where
   lookupAnchorTimeslot : Timeslot
   /-- p : Prerequisite work-package hashes. {ℍ} (power set). -/
   prerequisites : Array Hash
+  /-- ZODA polynomial commitment root for this work package's DA encoding.
+      Populated by the guarantor from the tensor encoding it already computed.
+      Services use this to bind proofs/circuits to their committed data.
+      NOT part of GP v0.7.2 — JAR extension for verifiable execution. -/
+  packageCommitmentRoot : Option Hash := none
 
 -- ============================================================================
 -- §11.1 — Work Report (eq:workreport)

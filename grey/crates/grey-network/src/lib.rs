@@ -5,6 +5,7 @@
 //! - Peer discovery and connection management
 //! - GRANDPA-like finality vote propagation
 
+pub mod safe_tip;
 pub mod service;
 
 /// Re-export signing contexts from grey-types (single source of truth).

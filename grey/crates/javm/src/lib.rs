@@ -18,6 +18,7 @@ pub mod gas_cost;
 pub mod gas_sim;
 pub mod instruction;
 pub mod interpreter;
+pub mod trace;
 #[cfg(feature = "std")]
 pub mod kernel;
 pub mod program;
@@ -34,6 +35,7 @@ pub mod recompiler {
 
 pub use backend::PvmBackend;
 pub use interpreter::Interpreter;
+pub use trace::{AccessWidth, BlockTrace, BlockStep, MemoryAccess, PvmSnapshot};
 #[cfg(feature = "std")]
 pub use kernel::CodeCache;
 
