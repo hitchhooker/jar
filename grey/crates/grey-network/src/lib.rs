@@ -5,6 +5,7 @@
 //! - Peer discovery and connection management
 //! - GRANDPA-like finality vote propagation
 
+pub mod safe_tip;
 pub mod service;
 
 /// Signing context strings used in the JAM protocol (Appendix I.4.5).

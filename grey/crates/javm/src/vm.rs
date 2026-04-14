@@ -96,6 +96,16 @@ pub struct Pvm {
     pub(crate) decoded_insts: Vec<DecodedInst>,
     /// Mapping from PC byte offset → instruction index. u32::MAX = invalid.
     pub(crate) pc_to_idx: Vec<u32>,
+    /// When true, collect basic block trace + memory access log.
+    pub block_tracing_enabled: bool,
+    /// Collected block trace (entry/exit state per basic block).
+    pub block_trace: crate::trace::BlockTrace,
+    /// Internal: entry snapshot for current basic block.
+    block_entry_snapshot: Option<crate::trace::PvmSnapshot>,
+    /// Internal: instruction count within current basic block.
+    block_inst_count: u32,
+    /// Internal: seq number at start of current basic block's accesses.
+    block_access_seq_start: u32,
 }
 
 impl Pvm {
@@ -139,7 +149,85 @@ impl Pvm {
             pc_trace: Vec::new(),
             decoded_insts,
             pc_to_idx,
+            block_tracing_enabled: false,
+            block_trace: crate::trace::BlockTrace::new(),
+            block_entry_snapshot: None,
+            block_inst_count: 0,
+            block_access_seq_start: 0,
         }
+    }
+
+    /// Take the collected block trace, replacing it with an empty one.
+    pub fn take_block_trace(&mut self) -> crate::trace::BlockTrace {
+        core::mem::take(&mut self.block_trace)
+    }
+
+    fn snapshot(&self) -> crate::trace::PvmSnapshot {
+        crate::trace::PvmSnapshot { pc: self.pc, registers: self.registers, gas: self.gas }
+    }
+
+    fn trace_block_entry(&mut self) {
+        if self.block_tracing_enabled {
+            self.block_entry_snapshot = Some(self.snapshot());
+            self.block_inst_count = 0;
+            self.block_access_seq_start = self.block_trace.current_seq();
+        }
+    }
+
+    fn trace_block_exit(&mut self) {
+        if self.block_tracing_enabled {
+            if let Some(entry) = self.block_entry_snapshot.take() {
+                let exit = self.snapshot();
+                self.block_trace.total_instructions += self.block_inst_count as u64;
+                self.block_trace.blocks.push(crate::trace::BlockStep {
+                    entry, exit,
+                    instruction_count: self.block_inst_count,
+                    access_seq_start: self.block_access_seq_start,
+                    access_seq_end: self.block_trace.current_seq(),
+                });
+            }
+        }
+    }
+
+    fn traced_read_u8(&mut self, addr: u32) -> Option<u8> {
+        let val = self.read_u8(addr)?;
+        if self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte1, false) { return None; }
+        Some(val)
+    }
+    fn traced_read_u16_le(&mut self, addr: u32) -> Option<u16> {
+        let val = self.read_u16_le(addr)?;
+        if self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte2, false) { return None; }
+        Some(val)
+    }
+    fn traced_read_u32_le(&mut self, addr: u32) -> Option<u32> {
+        let val = self.read_u32_le(addr)?;
+        if self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte4, false) { return None; }
+        Some(val)
+    }
+    fn traced_read_u64_le(&mut self, addr: u32) -> Option<u64> {
+        let val = self.read_u64_le(addr)?;
+        if self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte8, false) { return None; }
+        Some(val)
+    }
+    fn traced_write_u8(&mut self, addr: u32, val: u8) -> bool {
+        let ok = self.write_u8(addr, val);
+        if ok && self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte1, true) { return false; }
+        ok
+    }
+    fn traced_write_u16_le(&mut self, addr: u32, val: u16) -> bool {
+        let ok = self.write_u16_le(addr, val);
+        if ok && self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte2, true) { return false; }
+        ok
+    }
+    fn traced_write_u32_le(&mut self, addr: u32, val: u32) -> bool {
+        let ok = self.write_u32_le(addr, val);
+        if ok && self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val as u64, crate::trace::AccessWidth::Byte4, true) { return false; }
+        ok
+    }
+    fn traced_write_u64_le(&mut self, addr: u32, val: u64) -> bool {
+        let ok = self.write_u64_le(addr, val);
+        if ok && self.block_tracing_enabled && !self.block_trace.record_memory_access(addr, val, crate::trace::AccessWidth::Byte8, true) { return false; }
+        ok
     }
 
     /// Set the program counter to a specific offset.
@@ -383,8 +471,10 @@ impl Pvm {
         // terminators. Branch/jump targets are NOT gas block starts per spec
         // (Lean Interpreter.lean:130, GP PR #508).
         if self.need_gas_charge {
+            self.trace_block_entry();
             let block_cost = self.block_gas_costs[pc];
             if self.gas < block_cost {
+                self.trace_block_exit();
                 return Some(ExitReason::OutOfGas);
             }
             self.gas -= block_cost;
@@ -420,8 +510,8 @@ impl Pvm {
             // === A.5.2: One immediate ===
             Opcode::Ecalli => {
                 if let Args::Imm { imm } = args {
-                    // Advance PC to next instruction before returning (eq A.9)
                     self.pc = next_pc;
+                    self.trace_block_exit();
                     return Some(ExitReason::HostCall(imm as u32));
                 }
             }
@@ -439,7 +529,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u8(addr, imm_y as u8) {
+                    if self.traced_write_u8(addr, imm_y as u8) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -450,7 +540,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u16_le(addr, imm_y as u16) {
+                    if self.traced_write_u16_le(addr, imm_y as u16) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -461,7 +551,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u32_le(addr, imm_y as u32) {
+                    if self.traced_write_u32_le(addr, imm_y as u32) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -472,7 +562,7 @@ impl Pvm {
                 if let Args::TwoImm { imm_x, imm_y } = args {
                     let addr = imm_x as u32;
 
-                    if self.write_u64_le(addr, imm_y) {
+                    if self.traced_write_u64_le(addr, imm_y) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -512,7 +602,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -525,7 +615,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i8 as i64 as u64;
                             self.pc = next_pc;
@@ -538,7 +628,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -551,7 +641,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i16 as i64 as u64;
                             self.pc = next_pc;
@@ -564,7 +654,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -577,7 +667,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i32 as i64 as u64;
                             self.pc = next_pc;
@@ -590,7 +680,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v;
                             self.pc = next_pc;
@@ -603,7 +693,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u8(addr, self.registers[ra] as u8) {
+                    if self.traced_write_u8(addr, self.registers[ra] as u8) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -614,7 +704,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u16_le(addr, self.registers[ra] as u16) {
+                    if self.traced_write_u16_le(addr, self.registers[ra] as u16) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -625,7 +715,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u32_le(addr, self.registers[ra] as u32) {
+                    if self.traced_write_u32_le(addr, self.registers[ra] as u32) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -636,7 +726,7 @@ impl Pvm {
                 if let Args::RegImm { ra, imm } = args {
                     let addr = imm as u32;
 
-                    if self.write_u64_le(addr, self.registers[ra]) {
+                    if self.traced_write_u64_le(addr, self.registers[ra]) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -649,7 +739,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u8(addr, imm_y as u8) {
+                    if self.traced_write_u8(addr, imm_y as u8) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -660,7 +750,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u16_le(addr, imm_y as u16) {
+                    if self.traced_write_u16_le(addr, imm_y as u16) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -671,7 +761,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u32_le(addr, imm_y as u32) {
+                    if self.traced_write_u32_le(addr, imm_y as u32) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -682,7 +772,7 @@ impl Pvm {
                 if let Args::RegTwoImm { ra, imm_x, imm_y } = args {
                     let addr = self.registers[ra].wrapping_add(imm_x) as u32;
 
-                    if self.write_u64_le(addr, imm_y) {
+                    if self.traced_write_u64_le(addr, imm_y) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -811,7 +901,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u8(addr, self.registers[ra] as u8) {
+                    if self.traced_write_u8(addr, self.registers[ra] as u8) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -822,7 +912,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u16_le(addr, self.registers[ra] as u16) {
+                    if self.traced_write_u16_le(addr, self.registers[ra] as u16) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -833,7 +923,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u32_le(addr, self.registers[ra] as u32) {
+                    if self.traced_write_u32_le(addr, self.registers[ra] as u32) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -844,7 +934,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    if self.write_u64_le(addr, self.registers[ra]) {
+                    if self.traced_write_u64_le(addr, self.registers[ra]) {
                         self.pc = next_pc;
                     } else {
                         return Some(ExitReason::PageFault(addr & !0xFFF));
@@ -855,7 +945,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -868,7 +958,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i8 as i64 as u64;
                             self.pc = next_pc;
@@ -881,7 +971,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -894,7 +984,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i16 as i64 as u64;
                             self.pc = next_pc;
@@ -907,7 +997,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                             self.pc = next_pc;
@@ -920,7 +1010,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i32 as i64 as u64;
                             self.pc = next_pc;
@@ -933,7 +1023,7 @@ impl Pvm {
                 if let Args::TwoRegImm { ra, rb, imm } = args {
                     let addr = self.registers[rb].wrapping_add(imm) as u32;
 
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v;
                             self.pc = next_pc;
@@ -1548,7 +1638,10 @@ impl Pvm {
 
         // After execution: if this instruction is a terminator, the next
         // instruction starts a new basic block and needs gas charging.
+        if self.block_tracing_enabled { self.block_inst_count += 1; }
+
         if opcode.is_terminator() {
+            self.trace_block_exit();
             self.need_gas_charge = true;
         }
 
@@ -1589,7 +1682,33 @@ impl Pvm {
 
             // Per-gas-block charging (JAR v0.8.0): only at PC=0 and post-terminator starts
             if inst.bb_gas_cost > 0 {
+                if self.block_tracing_enabled {
+                    if let Some(entry) = self.block_entry_snapshot.take() {
+                        let exit = self.snapshot();
+                        self.block_trace.total_instructions += self.block_inst_count as u64;
+                        self.block_trace.blocks.push(crate::trace::BlockStep {
+                            entry, exit,
+                            instruction_count: self.block_inst_count,
+                            access_seq_start: self.block_access_seq_start,
+                            access_seq_end: self.block_trace.current_seq(),
+                        });
+                    }
+                    self.block_entry_snapshot = Some(self.snapshot());
+                    self.block_inst_count = 0;
+                    self.block_access_seq_start = self.block_trace.current_seq();
+                }
                 if self.gas < inst.bb_gas_cost {
+                    if self.block_tracing_enabled {
+                        if let Some(entry) = self.block_entry_snapshot.take() {
+                            let exit_snap = self.snapshot();
+                            self.block_trace.blocks.push(crate::trace::BlockStep {
+                                entry, exit: exit_snap,
+                                instruction_count: 0,
+                                access_seq_start: self.block_access_seq_start,
+                                access_seq_end: self.block_trace.current_seq(),
+                            });
+                        }
+                    }
                     self.pc = inst.pc;
                     return (ExitReason::OutOfGas, initial_gas - self.gas);
                 }
@@ -1617,6 +1736,20 @@ impl Pvm {
 
                 // === One immediate ===
                 Opcode::Ecalli => {
+                    if self.block_tracing_enabled {
+                        self.block_inst_count += 1;
+                        if let Some(entry) = self.block_entry_snapshot.take() {
+                            self.pc = next_pc;
+                            let exit_snap = self.snapshot();
+                            self.block_trace.total_instructions += self.block_inst_count as u64;
+                            self.block_trace.blocks.push(crate::trace::BlockStep {
+                                entry, exit: exit_snap,
+                                instruction_count: self.block_inst_count,
+                                access_seq_start: self.block_access_seq_start,
+                                access_seq_end: self.block_trace.current_seq(),
+                            });
+                        }
+                    }
                     self.pc = next_pc;
                     return (ExitReason::HostCall(imm1 as u32), initial_gas - self.gas);
                 }
@@ -1989,7 +2122,7 @@ impl Pvm {
                 // === Indirect loads (two reg + imm) ===
                 Opcode::LoadIndU8 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2000,7 +2133,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndI8 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i8 as i64 as u64;
                         }
@@ -2011,7 +2144,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndU16 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2022,7 +2155,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndI16 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i16 as i64 as u64;
                         }
@@ -2033,7 +2166,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndU32 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2044,7 +2177,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndI32 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i32 as i64 as u64;
                         }
@@ -2055,7 +2188,7 @@ impl Pvm {
                 }
                 Opcode::LoadIndU64 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v;
                         }
@@ -2068,25 +2201,25 @@ impl Pvm {
                 // === Indirect stores (two reg + imm) ===
                 Opcode::StoreIndU8 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    if !self.write_u8(addr, self.registers[ra] as u8) {
+                    if !self.traced_write_u8(addr, self.registers[ra] as u8) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreIndU16 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    if !self.write_u16_le(addr, self.registers[ra] as u16) {
+                    if !self.traced_write_u16_le(addr, self.registers[ra] as u16) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreIndU32 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    if !self.write_u32_le(addr, self.registers[ra] as u32) {
+                    if !self.traced_write_u32_le(addr, self.registers[ra] as u32) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreIndU64 => {
                     let addr = self.registers[rb].wrapping_add(imm1) as u32;
-                    if !self.write_u64_le(addr, self.registers[ra]) {
+                    if !self.traced_write_u64_le(addr, self.registers[ra]) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
@@ -2187,25 +2320,25 @@ impl Pvm {
                 // === Two immediates (store_imm: addr = imm1, value = imm2) ===
                 Opcode::StoreImmU8 => {
                     let addr = imm1 as u32;
-                    if !self.write_u8(addr, inst.imm2 as u8) {
+                    if !self.traced_write_u8(addr, inst.imm2 as u8) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmU16 => {
                     let addr = imm1 as u32;
-                    if !self.write_u16_le(addr, inst.imm2 as u16) {
+                    if !self.traced_write_u16_le(addr, inst.imm2 as u16) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmU32 => {
                     let addr = imm1 as u32;
-                    if !self.write_u32_le(addr, inst.imm2 as u32) {
+                    if !self.traced_write_u32_le(addr, inst.imm2 as u32) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmU64 => {
                     let addr = imm1 as u32;
-                    if !self.write_u64_le(addr, inst.imm2) {
+                    if !self.traced_write_u64_le(addr, inst.imm2) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
@@ -2213,7 +2346,7 @@ impl Pvm {
                 // === Absolute address loads (addr = imm1) ===
                 Opcode::LoadU8 => {
                     let addr = imm1 as u32;
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2224,7 +2357,7 @@ impl Pvm {
                 }
                 Opcode::LoadI8 => {
                     let addr = imm1 as u32;
-                    match self.read_u8(addr) {
+                    match self.traced_read_u8(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i8 as i64 as u64;
                         }
@@ -2235,7 +2368,7 @@ impl Pvm {
                 }
                 Opcode::LoadU16 => {
                     let addr = imm1 as u32;
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2246,7 +2379,7 @@ impl Pvm {
                 }
                 Opcode::LoadI16 => {
                     let addr = imm1 as u32;
-                    match self.read_u16_le(addr) {
+                    match self.traced_read_u16_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i16 as i64 as u64;
                         }
@@ -2257,7 +2390,7 @@ impl Pvm {
                 }
                 Opcode::LoadU32 => {
                     let addr = imm1 as u32;
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as u64;
                         }
@@ -2268,7 +2401,7 @@ impl Pvm {
                 }
                 Opcode::LoadI32 => {
                     let addr = imm1 as u32;
-                    match self.read_u32_le(addr) {
+                    match self.traced_read_u32_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v as i32 as i64 as u64;
                         }
@@ -2279,7 +2412,7 @@ impl Pvm {
                 }
                 Opcode::LoadU64 => {
                     let addr = imm1 as u32;
-                    match self.read_u64_le(addr) {
+                    match self.traced_read_u64_le(addr) {
                         Some(v) => {
                             self.registers[ra] = v;
                         }
@@ -2292,25 +2425,25 @@ impl Pvm {
                 // === Absolute address stores (addr = imm1, value = reg[ra]) ===
                 Opcode::StoreU8 => {
                     let addr = imm1 as u32;
-                    if !self.write_u8(addr, self.registers[ra] as u8) {
+                    if !self.traced_write_u8(addr, self.registers[ra] as u8) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreU16 => {
                     let addr = imm1 as u32;
-                    if !self.write_u16_le(addr, self.registers[ra] as u16) {
+                    if !self.traced_write_u16_le(addr, self.registers[ra] as u16) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreU32 => {
                     let addr = imm1 as u32;
-                    if !self.write_u32_le(addr, self.registers[ra] as u32) {
+                    if !self.traced_write_u32_le(addr, self.registers[ra] as u32) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreU64 => {
                     let addr = imm1 as u32;
-                    if !self.write_u64_le(addr, self.registers[ra]) {
+                    if !self.traced_write_u64_le(addr, self.registers[ra]) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
@@ -2318,25 +2451,25 @@ impl Pvm {
                 // === Store imm indirect (addr = reg[ra] + imm1, value = imm2) ===
                 Opcode::StoreImmIndU8 => {
                     let addr = self.registers[ra].wrapping_add(imm1) as u32;
-                    if !self.write_u8(addr, inst.imm2 as u8) {
+                    if !self.traced_write_u8(addr, inst.imm2 as u8) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmIndU16 => {
                     let addr = self.registers[ra].wrapping_add(imm1) as u32;
-                    if !self.write_u16_le(addr, inst.imm2 as u16) {
+                    if !self.traced_write_u16_le(addr, inst.imm2 as u16) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmIndU32 => {
                     let addr = self.registers[ra].wrapping_add(imm1) as u32;
-                    if !self.write_u32_le(addr, inst.imm2 as u32) {
+                    if !self.traced_write_u32_le(addr, inst.imm2 as u32) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
                 Opcode::StoreImmIndU64 => {
                     let addr = self.registers[ra].wrapping_add(imm1) as u32;
-                    if !self.write_u64_le(addr, inst.imm2) {
+                    if !self.traced_write_u64_le(addr, inst.imm2) {
                         exit = Some(ExitReason::PageFault(addr & !0xFFF));
                     }
                 }
@@ -2408,7 +2541,21 @@ impl Pvm {
                 }
             }
 
+            if self.block_tracing_enabled { self.block_inst_count += 1; }
+
             if let Some(reason) = exit {
+                if self.block_tracing_enabled {
+                    if let Some(entry) = self.block_entry_snapshot.take() {
+                        let exit_snap = self.snapshot();
+                        self.block_trace.total_instructions += self.block_inst_count as u64;
+                        self.block_trace.blocks.push(crate::trace::BlockStep {
+                            entry, exit: exit_snap,
+                            instruction_count: self.block_inst_count,
+                            access_seq_start: self.block_access_seq_start,
+                            access_seq_end: self.block_trace.current_seq(),
+                        });
+                    }
+                }
                 self.pc = inst.pc;
                 return (reason, initial_gas - self.gas);
             }

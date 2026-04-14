@@ -20,8 +20,10 @@ pub mod recompiler;
 #[cfg(all(feature = "std", not(all(target_os = "linux", target_arch = "x86_64"))))]
 #[path = "recompiler_shim.rs"]
 pub mod recompiler;
+pub mod trace;
 pub mod vm;
 
+pub use trace::{AccessWidth, BlockTrace, BlockStep, MemoryAccess, PvmSnapshot};
 #[cfg(feature = "std")]
 pub use recompiler::RecompiledPvm;
 pub use vm::{ExitReason, Pvm};

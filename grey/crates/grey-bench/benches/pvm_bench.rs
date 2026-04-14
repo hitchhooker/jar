@@ -1,13 +1,9 @@
 //! PVM benchmark: grey interpreter/recompiler vs polkavm interpreter/compiler.
 //!
-//! Eight workloads:
+//! Four workloads:
 //!   - fib: compute-intensive iterative Fibonacci (1M iterations)
 //!   - hostcall: host-call-heavy (100K ecalli invocations)
 //!   - sort: insertion sort of 1K u32 elements (compute + memory interleaved)
-//!   - sieve: Sieve of Eratosthenes up to 100K (memory + branching)
-//!   - blake2b: Blake2b-256 hash of 1KB message (crypto)
-//!   - keccak: Keccak-256 hash of 1KB message (crypto)
-//!   - ed25519: Ed25519 signature verification (crypto)
 //!   - ecrecover: secp256k1 ECDSA public key recovery (crypto-heavy)
 //!
 //! ## Benchmark fairness
@@ -20,16 +16,54 @@
 //! The interpreter benchmarks also re-parse the blob each iteration for the same
 //! reason.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 use grey_bench::*;
+
+const GAS_LIMIT: u64 = 100_000_000;
+
+// ---------------------------------------------------------------------------
+// Grey-PVM interpreter runner (parse + execute)
+// ---------------------------------------------------------------------------
+
+fn run_grey_interpreter(blob: &[u8]) -> (u64, u64) {
+    let mut pvm = javm::program::initialize_program(blob, &[], GAS_LIMIT).unwrap();
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            javm::ExitReason::Halt => break,
+            javm::ExitReason::HostCall(_) => continue,
+            other => panic!("unexpected exit: {:?}", other),
+        }
+    }
+    let result = pvm.registers[7]; // A0
+    let consumed = GAS_LIMIT - pvm.gas;
+    (result, consumed)
+}
+
+// ---------------------------------------------------------------------------
+// Grey-PVM recompiler runner (compile + execute)
+// ---------------------------------------------------------------------------
+
+fn run_grey_recompiler(blob: &[u8]) -> (u64, u64) {
+    let mut pvm =
+        javm::recompiler::initialize_program_recompiled(blob, &[], GAS_LIMIT).unwrap();
+    loop {
+        match pvm.run() {
+            javm::ExitReason::Halt => break,
+            javm::ExitReason::HostCall(_) => continue,
+            other => panic!("unexpected exit: {:?}", other),
+        }
+    }
+    let result = pvm.registers()[7]; // A0
+    let consumed = GAS_LIMIT - pvm.gas();
+    (result, consumed)
+}
 
 // ---------------------------------------------------------------------------
 // PolkaVM runners
 // ---------------------------------------------------------------------------
 
-use polkavm::{
-    BackendKind, Config, Engine, GasMeteringKind, InterruptKind, Module, ModuleConfig, SandboxKind,
-};
+use polkavm::{BackendKind, Config, Engine, GasMeteringKind, InterruptKind, Module, ModuleConfig, SandboxKind};
 use polkavm_common::program::Reg as PReg;
 
 fn polkavm_config(backend: BackendKind) -> Config {
@@ -97,7 +131,7 @@ fn run_polkavm_compile_and_run(blob: &[u8], engine: &Engine) -> (u64, i64) {
 // ---------------------------------------------------------------------------
 
 fn validate(name: &str, grey_blob: &[u8], pvm_blob: &[u8]) {
-    let (gi_result, gi_gas) = run_grey_interpreter(grey_blob, GAS_LIMIT);
+    let (gi_result, gi_gas) = run_grey_interpreter(grey_blob);
 
     let (_, pvm_module) = try_make_polkavm_module(pvm_blob, BackendKind::Interpreter)
         .expect("polkavm interpreter should always work");
@@ -106,11 +140,9 @@ fn validate(name: &str, grey_blob: &[u8], pvm_blob: &[u8]) {
     eprintln!(
         "{name}: grey result={gi_result} gas={gi_gas}, polkavm result={pvm_result} gas={pvm_gas}"
     );
-    // Compare lower 32 bits only: RISC-V ABI sign-extends u32 returns to 64 bits
-    // on rv64, but polkavm may zero-extend. Both produce the same 32-bit result.
     assert_eq!(
-        gi_result as u32, pvm_result as u32,
-        "{name}: grey/polkavm result mismatch (grey=0x{gi_result:X}, polkavm=0x{pvm_result:X})"
+        gi_result, pvm_result,
+        "{name}: grey/polkavm result mismatch"
     );
     // Gas values differ: JAVM uses pipeline gas (JAR v0.8.0),
     // polkavm uses per-instruction gas (GP v0.7.2).
@@ -120,40 +152,65 @@ fn validate(name: &str, grey_blob: &[u8], pvm_blob: &[u8]) {
 // Benchmarks
 // ---------------------------------------------------------------------------
 
-/// Standard benchmark group: grey interpreter + recompiler + polkavm interpreter + compiler.
-fn bench_standard(c: &mut Criterion, name: &str, grey_blob: &[u8], pvm_blob: &[u8]) {
-    validate(name, grey_blob, pvm_blob);
+fn bench_fib(c: &mut Criterion) {
+    let grey_blob = grey_fib_blob(FIB_N);
+    let pvm_blob = polkavm_fib_blob(FIB_N);
 
-    let (_, pvm_interp_mod) = try_make_polkavm_module(pvm_blob, BackendKind::Interpreter)
+    validate("fib", &grey_blob, &pvm_blob);
+
+    let (_, pvm_interp_mod) = try_make_polkavm_module(&pvm_blob, BackendKind::Interpreter)
         .expect("polkavm interpreter should always work");
-    let pvm_compiler = try_make_polkavm_module(pvm_blob, BackendKind::Compiler);
+    let pvm_compiler = try_make_polkavm_module(&pvm_blob, BackendKind::Compiler);
+    if pvm_compiler.is_none() {
+        eprintln!("polkavm compiler backend unavailable (sandbox/platform restriction), skipping");
+    }
 
-    let mut group = c.benchmark_group(name);
+    let mut group = c.benchmark_group("fib");
 
     group.bench_function("grey-interpreter", |b| {
-        b.iter(|| run_grey_interpreter(grey_blob, GAS_LIMIT))
+        b.iter(|| run_grey_interpreter(&grey_blob))
     });
 
     group.bench_function("grey-recompiler", |b| {
-        b.iter(|| run_grey_recompiler(grey_blob, GAS_LIMIT))
+        b.iter(|| run_grey_recompiler(&grey_blob))
     });
 
-    // Execution-only: compile in setup (not timed), measure only execution.
-    group.bench_function("grey-recompiler-exec", |b| {
-        b.iter_batched(
-            || javm::recompiler::initialize_program_recompiled(grey_blob, &[], GAS_LIMIT).unwrap(),
-            |mut pvm| {
-                loop {
-                    match pvm.run() {
-                        javm::ExitReason::Halt => break,
-                        javm::ExitReason::HostCall(_) => continue,
-                        other => panic!("unexpected exit: {:?}", other),
-                    }
-                }
-                pvm.registers()[7]
-            },
-            criterion::BatchSize::SmallInput,
-        );
+    group.bench_function("polkavm-interpreter", |b| {
+        b.iter(|| run_polkavm_module(&pvm_interp_mod))
+    });
+
+    if let Some((ref engine, ref pvm_mod)) = pvm_compiler {
+        // Execution-only (pre-compiled module, amortized compilation cost)
+        group.bench_function("polkavm-compiler-exec", |b| {
+            b.iter(|| run_polkavm_module(pvm_mod))
+        });
+        // Compile + execute (fair comparison with grey-recompiler)
+        group.bench_function("polkavm-compiler-full", |b| {
+            b.iter(|| run_polkavm_compile_and_run(&pvm_blob, engine))
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_hostcall(c: &mut Criterion) {
+    let grey_blob = grey_hostcall_blob(HOSTCALL_N);
+    let pvm_blob = polkavm_hostcall_blob(HOSTCALL_N);
+
+    validate("hostcall", &grey_blob, &pvm_blob);
+
+    let (_, pvm_interp_mod) = try_make_polkavm_module(&pvm_blob, BackendKind::Interpreter)
+        .expect("polkavm interpreter should always work");
+    let pvm_compiler = try_make_polkavm_module(&pvm_blob, BackendKind::Compiler);
+
+    let mut group = c.benchmark_group("hostcall");
+
+    group.bench_function("grey-interpreter", |b| {
+        b.iter(|| run_grey_interpreter(&grey_blob))
+    });
+
+    group.bench_function("grey-recompiler", |b| {
+        b.iter(|| run_grey_recompiler(&grey_blob))
     });
 
     group.bench_function("polkavm-interpreter", |b| {
@@ -165,45 +222,47 @@ fn bench_standard(c: &mut Criterion, name: &str, grey_blob: &[u8], pvm_blob: &[u
             b.iter(|| run_polkavm_module(pvm_mod))
         });
         group.bench_function("polkavm-compiler-full", |b| {
-            b.iter(|| run_polkavm_compile_and_run(pvm_blob, engine))
+            b.iter(|| run_polkavm_compile_and_run(&pvm_blob, engine))
         });
     }
 
     group.finish();
 }
 
-fn bench_fib(c: &mut Criterion) {
-    let grey_blob = grey_fib_blob(FIB_N);
-    let pvm_blob = polkavm_fib_blob(FIB_N);
-    bench_standard(c, "fib", &grey_blob, &pvm_blob);
-}
-
-fn bench_hostcall(c: &mut Criterion) {
-    let grey_blob = grey_hostcall_blob(HOSTCALL_N);
-    let pvm_blob = polkavm_hostcall_blob(HOSTCALL_N);
-    bench_standard(c, "hostcall", &grey_blob, &pvm_blob);
-}
-
 fn bench_sort(c: &mut Criterion) {
     let grey_blob = grey_sort_blob(SORT_N);
     let pvm_blob = polkavm_sort_blob(SORT_N);
-    bench_standard(c, "sort", &grey_blob, &pvm_blob);
-}
 
-fn bench_sieve(c: &mut Criterion) {
-    bench_standard(c, "sieve", grey_sieve_blob(), polkavm_sieve_blob());
-}
+    validate("sort", &grey_blob, &pvm_blob);
 
-fn bench_blake2b(c: &mut Criterion) {
-    bench_standard(c, "blake2b", grey_blake2b_blob(), polkavm_blake2b_blob());
-}
+    let (_, pvm_interp_mod) = try_make_polkavm_module(&pvm_blob, BackendKind::Interpreter)
+        .expect("polkavm interpreter should always work");
+    let pvm_compiler = try_make_polkavm_module(&pvm_blob, BackendKind::Compiler);
 
-fn bench_keccak(c: &mut Criterion) {
-    bench_standard(c, "keccak", grey_keccak_blob(), polkavm_keccak_blob());
-}
+    let mut group = c.benchmark_group("sort");
 
-fn bench_ed25519(c: &mut Criterion) {
-    bench_standard(c, "ed25519", grey_ed25519_blob(), polkavm_ed25519_blob());
+    group.bench_function("grey-interpreter", |b| {
+        b.iter(|| run_grey_interpreter(&grey_blob))
+    });
+
+    group.bench_function("grey-recompiler", |b| {
+        b.iter(|| run_grey_recompiler(&grey_blob))
+    });
+
+    group.bench_function("polkavm-interpreter", |b| {
+        b.iter(|| run_polkavm_module(&pvm_interp_mod))
+    });
+
+    if let Some((ref engine, ref pvm_mod)) = pvm_compiler {
+        group.bench_function("polkavm-compiler-exec", |b| {
+            b.iter(|| run_polkavm_module(pvm_mod))
+        });
+        group.bench_function("polkavm-compiler-full", |b| {
+            b.iter(|| run_polkavm_compile_and_run(&pvm_blob, engine))
+        });
+    }
+
+    group.finish();
 }
 
 fn bench_ecrecover(c: &mut Criterion) {
@@ -211,7 +270,7 @@ fn bench_ecrecover(c: &mut Criterion) {
     let pvm_blob = polkavm_ecrecover_blob();
     let ecrecover_gas: u64 = i64::MAX as u64;
 
-    let pvm_compiler = try_make_polkavm_module(pvm_blob, BackendKind::Compiler);
+    let pvm_compiler = try_make_polkavm_module(&pvm_blob, BackendKind::Compiler);
 
     let mut group = c.benchmark_group("ecrecover");
     group.sample_size(10); // ecrecover is slow — fewer samples
@@ -219,17 +278,21 @@ fn bench_ecrecover(c: &mut Criterion) {
     // Native baseline: run k256 ecrecover directly on the host CPU
     group.bench_function("native", |b| {
         b.iter(|| {
-            use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+            use k256::ecdsa::{Signature, RecoveryId, VerifyingKey};
             let msg: [u8; 32] = [
-                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-                0x66, 0x77, 0x88, 0x99,
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+                0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
             ];
             let sig_bytes: [u8; 64] = [
-                0xff, 0x65, 0x1c, 0x65, 0xee, 0xde, 0xd4, 0x63, 0x83, 0xa4, 0xbd, 0xcd, 0x91, 0x70,
-                0xff, 0x65, 0x9a, 0x4f, 0x61, 0x7b, 0xb6, 0x58, 0xa4, 0x6d, 0xd4, 0x56, 0xc5, 0x1e,
-                0xc8, 0xcc, 0x21, 0x1a, 0x7d, 0xc4, 0xde, 0x91, 0xd0, 0xc8, 0x47, 0xbf, 0x5d, 0xef,
-                0x99, 0x5b, 0xd0, 0x43, 0x65, 0x81, 0x36, 0xfe, 0x21, 0x35, 0xaf, 0xe6, 0x92, 0x82,
+                0xff, 0x65, 0x1c, 0x65, 0xee, 0xde, 0xd4, 0x63,
+                0x83, 0xa4, 0xbd, 0xcd, 0x91, 0x70, 0xff, 0x65,
+                0x9a, 0x4f, 0x61, 0x7b, 0xb6, 0x58, 0xa4, 0x6d,
+                0xd4, 0x56, 0xc5, 0x1e, 0xc8, 0xcc, 0x21, 0x1a,
+                0x7d, 0xc4, 0xde, 0x91, 0xd0, 0xc8, 0x47, 0xbf,
+                0x5d, 0xef, 0x99, 0x5b, 0xd0, 0x43, 0x65, 0x81,
+                0x36, 0xfe, 0x21, 0x35, 0xaf, 0xe6, 0x92, 0x82,
                 0xf7, 0xde, 0x87, 0x39, 0x90, 0xda, 0xcb, 0x77,
             ];
             let sig = Signature::from_slice(&sig_bytes).unwrap();
@@ -241,7 +304,9 @@ fn bench_ecrecover(c: &mut Criterion) {
 
     group.bench_function("grey-interpreter", |b| {
         b.iter(|| {
-            let mut pvm = javm::program::initialize_program(grey_blob, &[], ecrecover_gas).unwrap();
+            let mut pvm = javm::program::initialize_program(
+                &grey_blob, &[], ecrecover_gas,
+            ).unwrap();
             loop {
                 let (exit, _) = pvm.run();
                 match exit {
@@ -256,9 +321,9 @@ fn bench_ecrecover(c: &mut Criterion) {
 
     group.bench_function("grey-recompiler", |b| {
         b.iter(|| {
-            let mut pvm =
-                javm::recompiler::initialize_program_recompiled(grey_blob, &[], ecrecover_gas)
-                    .unwrap();
+            let mut pvm = javm::recompiler::initialize_program_recompiled(
+                &grey_blob, &[], ecrecover_gas,
+            ).unwrap();
             loop {
                 match pvm.run() {
                     javm::ExitReason::Halt | javm::ExitReason::Panic => break,
@@ -270,24 +335,13 @@ fn bench_ecrecover(c: &mut Criterion) {
         })
     });
 
-    // Compile-only: measure only JIT compilation time (no execution).
-    group.bench_function("grey-recompiler-compile", |b| {
-        b.iter(|| {
-            std::hint::black_box(
-                javm::recompiler::initialize_program_recompiled(grey_blob, &[], ecrecover_gas)
-                    .unwrap(),
-            );
-        })
-    });
-
     // Execution-only: compile in setup (not timed), measure only execution.
     // Separates JIT compilation time from execution time.
     group.bench_function("grey-recompiler-exec", |b| {
         b.iter_batched(
-            || {
-                javm::recompiler::initialize_program_recompiled(grey_blob, &[], ecrecover_gas)
-                    .unwrap()
-            },
+            || javm::recompiler::initialize_program_recompiled(
+                &grey_blob, &[], ecrecover_gas,
+            ).unwrap(),
             |mut pvm| {
                 loop {
                     match pvm.run() {
@@ -302,7 +356,7 @@ fn bench_ecrecover(c: &mut Criterion) {
         );
     });
 
-    let pvm_interp = try_make_polkavm_module(pvm_blob, BackendKind::Interpreter);
+    let pvm_interp = try_make_polkavm_module(&pvm_blob, BackendKind::Interpreter);
     if let Some((_, ref pvm_interp_mod)) = pvm_interp {
         group.bench_function("polkavm-interpreter", |b| {
             b.iter(|| {
@@ -349,22 +403,11 @@ fn bench_ecrecover(c: &mut Criterion) {
                 inst.reg(PReg::A0)
             })
         });
-        let pvm_config = polkavm_config(BackendKind::Compiler);
-        group.bench_function("polkavm-compiler-compile", |b| {
-            b.iter(|| {
-                // Include Engine::new to match grey's FlatMemory + assembler mmap.
-                // In JAM, each work-package is compiled from scratch.
-                let engine = Engine::new(&pvm_config).unwrap();
-                let mut mc = ModuleConfig::new();
-                mc.set_gas_metering(Some(GasMeteringKind::Sync));
-                std::hint::black_box(Module::new(&engine, &mc, pvm_blob.into()).unwrap());
-            })
-        });
         group.bench_function("polkavm-compiler-full", |b| {
             b.iter(|| {
                 let mut mc = ModuleConfig::new();
                 mc.set_gas_metering(Some(GasMeteringKind::Sync));
-                let module = Module::new(engine, &mc, pvm_blob.into()).unwrap();
+                let module = Module::new(engine, &mc, pvm_blob.clone().into()).unwrap();
                 let mut inst = module.instantiate().unwrap();
                 inst.set_gas(ecrecover_gas as i64);
                 if let Some(export) = module.exports().next() {
@@ -389,15 +432,95 @@ fn bench_ecrecover(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_fib,
-    bench_hostcall,
-    bench_sort,
-    bench_sieve,
-    bench_blake2b,
-    bench_keccak,
-    bench_ed25519,
-    bench_ecrecover
-);
+// ---------------------------------------------------------------------------
+// Trace overhead benchmarks
+// ---------------------------------------------------------------------------
+
+/// Run grey interpreter with block tracing enabled (trace + memory log).
+fn run_grey_with_tracing(blob: &[u8]) -> (u64, u64, usize, usize) {
+    let mut pvm = javm::program::initialize_program(blob, &[], GAS_LIMIT).unwrap();
+    pvm.block_tracing_enabled = true;
+    loop {
+        let (exit, _) = pvm.run();
+        match exit {
+            javm::ExitReason::Halt => break,
+            javm::ExitReason::HostCall(_) => continue,
+            other => panic!("unexpected exit: {:?}", other),
+        }
+    }
+    let trace = pvm.take_block_trace();
+    let result = pvm.registers[7];
+    let consumed = GAS_LIMIT - pvm.gas;
+    (result, consumed, trace.num_blocks(), trace.num_memory_accesses())
+}
+
+fn bench_trace_overhead(c: &mut Criterion) {
+    let fib_blob = grey_fib_blob(FIB_N);
+    let sort_blob = grey_sort_blob(SORT_N);
+
+    // Validate tracing produces same results
+    let (fib_r, fib_g) = run_grey_interpreter(&fib_blob);
+    let (fib_tr, fib_tg, fib_blocks, fib_accesses) = run_grey_with_tracing(&fib_blob);
+    assert_eq!(fib_r, fib_tr, "fib: tracing changed result");
+    assert_eq!(fib_g, fib_tg, "fib: tracing changed gas");
+    eprintln!("fib trace: {} blocks, {} memory accesses", fib_blocks, fib_accesses);
+
+    let (sort_r, sort_g) = run_grey_interpreter(&sort_blob);
+    let (sort_tr, sort_tg, sort_blocks, sort_accesses) = run_grey_with_tracing(&sort_blob);
+    assert_eq!(sort_r, sort_tr, "sort: tracing changed result");
+    assert_eq!(sort_g, sort_tg, "sort: tracing changed gas");
+    eprintln!("sort trace: {} blocks, {} memory accesses", sort_blocks, sort_accesses);
+
+    let mut group = c.benchmark_group("trace_overhead");
+
+    // Compare: fast path (pre-decoded) vs stepping (no trace) vs stepping (with trace)
+    // The interesting overhead is stepping+trace vs stepping-only.
+    // Fast path vs stepping is ~20x — that's the interpreter overhead, not trace cost.
+
+    group.bench_function("fib/fast-path", |b| {
+        b.iter(|| run_grey_interpreter(&fib_blob))
+    });
+    group.bench_function("fib/stepping-no-trace", |b| {
+        b.iter(|| {
+            let mut pvm = javm::program::initialize_program(&fib_blob, &[], GAS_LIMIT).unwrap();
+            pvm.tracing_enabled = true; // forces stepping path WITHOUT block trace
+            loop {
+                let (exit, _) = pvm.run();
+                match exit {
+                    javm::ExitReason::Halt => break,
+                    javm::ExitReason::HostCall(_) => continue,
+                    other => panic!("unexpected exit: {:?}", other),
+                }
+            }
+        })
+    });
+    group.bench_function("fib/fast-with-trace", |b| {
+        b.iter(|| run_grey_with_tracing(&fib_blob))
+    });
+
+    group.bench_function("sort/fast-path", |b| {
+        b.iter(|| run_grey_interpreter(&sort_blob))
+    });
+    group.bench_function("sort/stepping-no-trace", |b| {
+        b.iter(|| {
+            let mut pvm = javm::program::initialize_program(&sort_blob, &[], GAS_LIMIT).unwrap();
+            pvm.tracing_enabled = true;
+            loop {
+                let (exit, _) = pvm.run();
+                match exit {
+                    javm::ExitReason::Halt => break,
+                    javm::ExitReason::HostCall(_) => continue,
+                    other => panic!("unexpected exit: {:?}", other),
+                }
+            }
+        })
+    });
+    group.bench_function("sort/fast-with-trace", |b| {
+        b.iter(|| run_grey_with_tracing(&sort_blob))
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_fib, bench_hostcall, bench_sort, bench_ecrecover, bench_trace_overhead);
 criterion_main!(benches);

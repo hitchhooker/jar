@@ -27,6 +27,8 @@ const ASSURANCES_TOPIC: &str = "/jam/assurances/1";
 const ANNOUNCEMENTS_TOPIC: &str = "/jam/announcements/1";
 /// Gossipsub topic for Safrole ticket submissions.
 const TICKETS_TOPIC: &str = "/jam/tickets/1";
+/// Gossipsub topic for ELVES audit approvals.
+const APPROVALS_TOPIC: &str = "/jam/approvals/1";
 
 /// Messages that the network service can send to the node.
 #[derive(Debug)]
@@ -43,6 +45,8 @@ pub enum NetworkEvent {
     AnnouncementReceived { data: Vec<u8>, source: PeerId },
     /// A ticket proof was received from a peer.
     TicketReceived { data: Vec<u8>, source: PeerId },
+    /// An ELVES audit approval was received from a peer.
+    ApprovalReceived { data: Vec<u8>, source: PeerId },
     /// A chunk fetch request was received.
     ChunkRequest {
         report_hash: [u8; 32],
@@ -67,7 +71,7 @@ pub enum NetworkCommand {
     /// Broadcast a block to the network.
     BroadcastBlock { data: Vec<u8> },
     /// Broadcast a finality vote.
-    BroadcastFinalityVote { data: Vec<u8> },
+    BroadcastFinalityVote { data: Vec<u8>, priority: bool },
     /// Broadcast a work report guarantee.
     BroadcastGuarantee { data: Vec<u8> },
     /// Broadcast an availability assurance.
@@ -76,6 +80,8 @@ pub enum NetworkCommand {
     BroadcastAnnouncement { data: Vec<u8> },
     /// Broadcast a ticket proof.
     BroadcastTicket { data: Vec<u8> },
+    /// Broadcast an ELVES approval (auditor verified a work report).
+    BroadcastApproval { data: Vec<u8>, priority: bool },
     /// Request a chunk from a specific peer.
     FetchChunk {
         peer: PeerId,
@@ -340,6 +346,7 @@ pub async fn start_network(
     let assurances_topic = gossipsub::IdentTopic::new(ASSURANCES_TOPIC);
     let announcements_topic = gossipsub::IdentTopic::new(ANNOUNCEMENTS_TOPIC);
     let tickets_topic = gossipsub::IdentTopic::new(TICKETS_TOPIC);
+    let approvals_topic = gossipsub::IdentTopic::new(APPROVALS_TOPIC);
 
     for (topic, name) in [
         (&blocks_topic, "blocks"),
@@ -348,6 +355,7 @@ pub async fn start_network(
         (&assurances_topic, "assurances"),
         (&announcements_topic, "announcements"),
         (&tickets_topic, "tickets"),
+        (&approvals_topic, "approvals"),
     ] {
         swarm
             .behaviour_mut()
@@ -395,6 +403,7 @@ pub async fn start_network(
         assurances: assurances_topic,
         announcements: announcements_topic,
         tickets: tickets_topic,
+        approvals: approvals_topic,
     };
     tokio::spawn(async move {
         run_network_loop(swarm, event_tx, cmd_rx, topics, validator_index).await;
@@ -419,6 +428,7 @@ struct TopicSet {
     assurances: gossipsub::IdentTopic,
     announcements: gossipsub::IdentTopic,
     tickets: gossipsub::IdentTopic,
+    approvals: gossipsub::IdentTopic,
 }
 
 fn build_swarm() -> Result<Swarm<JamBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
@@ -614,6 +624,11 @@ async fn run_network_loop(
                                 data: message.data,
                                 source: propagation_source,
                             }, low);
+                        } else if topic == APPROVALS_TOPIC {
+                            send_event!(NetworkEvent::ApprovalReceived {
+                                data: message.data,
+                                source: propagation_source,
+                            }, high);
                         }
                     }
                     // Handle request-response events
@@ -783,7 +798,7 @@ async fn run_network_loop(
                     NetworkCommand::BroadcastBlock { data } => {
                         publish!(topics.blocks, data, "block");
                     }
-                    NetworkCommand::BroadcastFinalityVote { data } => {
+                    NetworkCommand::BroadcastFinalityVote { data, priority: _ } => {
                         publish!(topics.finality, data, "finality vote");
                     }
                     NetworkCommand::BroadcastGuarantee { data } => {
@@ -797,6 +812,9 @@ async fn run_network_loop(
                     }
                     NetworkCommand::BroadcastTicket { data } => {
                         publish!(topics.tickets, data, "ticket");
+                    }
+                    NetworkCommand::BroadcastApproval { data, priority: _ } => {
+                        publish!(topics.approvals, data, "approval");
                     }
                     NetworkCommand::FetchChunk { peer, report_hash, chunk_index, response_tx } => {
                         // Build request: [0x01][report_hash(32)][chunk_idx(2)]

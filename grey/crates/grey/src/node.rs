@@ -35,7 +35,7 @@ fn broadcast_vote(
     msg: &finality::VoteMessage,
 ) {
     let data = finality::encode_vote_message(msg);
-    let _ = net_commands.try_send(NetworkCommand::BroadcastFinalityVote { data });
+    let _ = net_commands.try_send(NetworkCommand::BroadcastFinalityVote { data, priority: true });
 }
 
 /// Node configuration.
@@ -1256,6 +1256,14 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                     source
                                 );
                             }
+                    }
+                    NetworkEvent::ApprovalReceived { data, source } => {
+                        tracing::debug!(
+                            "Validator {} received ELVES approval ({} bytes) from {}",
+                            config.validator_index,
+                            data.len(),
+                            source
+                        );
                     }
                     NetworkEvent::PeerIdentified { peer_id, validator_index: vi } => {
                         tracing::info!(
